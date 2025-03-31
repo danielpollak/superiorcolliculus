@@ -327,10 +327,6 @@ def generate_transition_matrix(event_df):
     return mat, ax
 
 
-
-
-
-
 def set_axis_units(ax, conversion_rate):
     ax.set_xticklabels(ax.get_xticks() // conversion_rate)
     ax.set_yticklabels(ax.get_yticks() // conversion_rate)
@@ -338,20 +334,24 @@ def set_axis_units(ax, conversion_rate):
     ax.set_ylabel("cm")
 
 
-def format_behavior_ax(ax):
+def format_behavior_ax(ax, scalebar_color="k"):
+    """Format the axis for the behavior plots
+    Set x/y limits, remove ticks, and set aspect ratio
+    Add a scale bar"""
     ax.set_xlim((0, 900))
     ax.set_ylim((0, 800))
     ax.axis("equal")
     # remove gridlines on the axis
     # Make a 10 cm scale bar
-    ax.plot([10 * conversion_rate, 20 * conversion_rate], [1 * conversion_rate, 1 * conversion_rate], c="k")
-    ax.text(10 * conversion_rate, 3 * conversion_rate, "10 cm", fontsize=10)
+    ax.plot([10 * conversion_rate, 20 * conversion_rate], [1 * conversion_rate, 1 * conversion_rate], c=scalebar_color, lw=2)
+    ax.text(10 * conversion_rate, 3 * conversion_rate, "10 cm", fontsize=10, color=scalebar_color)
     ax.set_xticklabels([])
     ax.set_yticklabels([])
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_xlabel("")
     ax.set_ylabel("")
+    # To agree the DLC with the video, which is inverted by DLC.
     ax.grid(False)
 
 def generate_event_triggered_maps(event_df, behavior, DLC_metric, win=10, ax=None):
@@ -388,59 +388,56 @@ def generate_event_triggered_maps(event_df, behavior, DLC_metric, win=10, ax=Non
 
 
 
-def plot_behavior_bout(generator_vars):
-    (
-        relevant_measures, win_head_theta, win_snout_x, win_snout_y,
-        win_body_vector, win_head_vector, win_target_x, win_target_y,
-        win_target_vector, win_target_theta, win, n_frames, avi_file, boris_tsv, dlc_csv, event_i, boris_df
-    ) = generator_vars
+def plot_behavior_bout(generator_vars, cmap_name="nipy_spectral"):
+    (relevant_measures, win_head_angle, win_snout_x, win_snout_y, win_body_vector, win_head_vector, win_target_x, win_target_y,
+    win_target_position, win_target_bearing, win, n_frames, avi_file, boris_tsv, dlc_csv, event_i, boris_df) = generator_vars
 
     # Whole-video level variables
-    (
-        _, head_vector, body_vector, ego_theta, _,
-        head_theta, dist, mouse_speeds, target_speeds, (neck_x, neck_y),
-        (snout_x, snout_y), (base_x, base_y), (_, _), df
-    ) = relevant_measures
+    (_, head_vector, body_vector, ego_angle, _, head_angle, dist, mouse_speeds, target_speeds, (neck_x, neck_y),
+    (snout_x, snout_y), (base_x, base_y), (_, _), df) = relevant_measures
 
     fig, axes = plt.subplots(3, 2, figsize=(10, 15))
     axes = axes.flatten()
-    cmap_name = "nipy_spectral"
-
     # Length of each vector is inter-frame distance.
     # For top two panels:
     for ax in axes[:2]:
-        ax.quiver(
-            win_target_x[:-1], win_target_y[:-1], np.diff(win_target_x), np.diff(win_target_y),
-            scale=1, scale_units='xy', angles='xy', color=sns.color_palette(cmap_name, n_colors=n_frames),
-            width=0.002, label="head-target")
+        ax.scatter(
+            win_target_x[::2], win_target_y[::2], 
+            color=sns.color_palette(cmap_name, n_colors=len(win_target_x[::2])),
+            s=1, label="head-target")
+        
+        # ax.quiver(
+        #     win_target_x[:-1], win_target_y[:-1], np.diff(win_target_x), np.diff(win_target_y),
+        #     scale=1, scale_units='xy', angles='xy', color=sns.color_palette(cmap_name, n_colors=n_frames),
+        #     width=0.002, label="head-target")
         ax.set_title("Target position")
 
     # Euclidian distance between snout and target
-    snout_heading_difference = get_angular_difference(win_target_theta, win_head_theta)
+    snout_heading_difference = get_angular_difference(win_target_bearing, win_head_angle)
 
     # Body directions
     # Length of each vector is unit
     win_base = base_x[win[0]:win[1]] + base_y[win[0]:win[1]] * 1j
     win_neck = neck_x[win[0]:win[1]] + neck_y[win[0]:win[1]] * 1j
     axes[2].quiver(
-        win_base.values.real,
-        win_base.values.imag,
-        win_neck.values.real-win_base.values.real,
-        win_neck.values.imag-win_base.values.imag,
-        scale=1, scale_units='xy', angles='xy', width=0.002, label="head angle",
-        color=sns.color_palette(cmap_name, n_colors=n_frames))
+        win_base.real[::2],
+        win_base.imag[::2],
+        win_neck.real[::2] - win_base.real[::2],
+        win_neck.imag[::2] - win_base.imag[::2],
+        scale=1, scale_units='xy', angles='xy', width=0.004, label="head angle",
+        color=sns.color_palette(cmap_name, n_colors=len(win_base.real[::2])))
 
     # Length of each vector is unit
     axes[3].quiver(
-        win_neck.values.real,
-        win_neck.values.imag,
-        win_snout_x-win_neck.values.real,
-        win_snout_y-win_neck.values.imag,
-        scale=1, scale_units='xy', angles='xy', width=0.002, label="head angle",
-        color=sns.color_palette(cmap_name, n_colors=n_frames))
+        win_neck.real[::2],
+        win_neck.imag[::2],
+        win_snout_x[::2] - win_neck.real[::2],
+        win_snout_y[::2] - win_neck.imag[::2],
+        scale=1, scale_units='xy', angles='xy', width=0.004, label="head angle",
+        color=sns.color_palette(cmap_name, n_colors=len(win_neck.real[::2])))
 
     # Get heading inaccuracy from body line to target.
-    body_heading_difference = get_angular_difference(win_target_theta, np.angle(win_body_vector, deg=True))
+    body_heading_difference = get_angular_difference(win_target_bearing, np.angle(win_body_vector, deg=True))
     axes[4].scatter(
         np.arange(len(body_heading_difference)), body_heading_difference, marker="|",
         c=sns.color_palette(cmap_name, n_colors=n_frames))
@@ -468,7 +465,7 @@ def plot_behavior_bout(generator_vars):
     [ax.grid(False) for ax in axes]
 
     for ax in [axes[4], axes[5]]:
-        ax.set_xticklabels(np.round(ax.get_xticks() / 30, 1))
+        ax.set_xticklabels(np.round(ax.get_xticks() / 30.01, 2))
         ax.set_xlabel("time (s)")
 
     axes[1].set_title("Target position")
@@ -484,21 +481,28 @@ def plot_behavior_bout(generator_vars):
     return fig, axes
 
 
-def plot_traintracks(pos, target_positions, ax, crossties=False):
+def plot_traintracks(pos, target_positions, ax, crossties=0):
+    assert np.iscomplexobj(pos)
+    assert np.iscomplexobj(target_positions)
+    
+    plot_kwargs = {"alpha":1, "linewidth":2}
     # Plot position of target
-    ax.plot(target_positions.real, target_positions.imag, c="orange", alpha=0.3, label="target")
-    ax.plot(target_positions.real[0], target_positions.imag[0], c="orange", alpha=0.3, marker="o")
+    ax.plot(target_positions.real, target_positions.imag, c="orange", **plot_kwargs, label="target")
+    ax.plot(target_positions.real[0], target_positions.imag[0], c="orange", **plot_kwargs, marker="o")
 
     # Plot ground truth for pursuer
-    ax.plot(pos.real, pos.imag, c="b", alpha=0.3, label="pursuer")
-    ax.plot(pos.real[0], pos.imag[0], c="b", alpha=0.3, marker="o")
+    ax.plot(pos.real, pos.imag, c="b", **plot_kwargs,label="pursuer")
+    ax.plot(pos.real[0], pos.imag[0], c="b", **plot_kwargs, marker="o")
 
     if crossties:
-        for xtie_ind in np.arange(0, len(pos), 10):
+        for xtie_ind in np.arange(0, len(pos), crossties):
             ax.plot(
                 [pos.real[xtie_ind], target_positions.real[xtie_ind]],
                 [pos.imag[xtie_ind], target_positions.imag[xtie_ind]],
-                c="k", alpha=0.3)
+                c="k", alpha=0.3, linestyle="dashed")
+            
+            
+    # ax.legend()
 
 
 """Neuropixel"""
@@ -590,3 +594,143 @@ def plot_zoomed_annot_timeseries(recording, sorting, unit_df, expt, tr1=[2, 3], 
     fig.savefig(r"\\datanas\family\SC\data_agg\physiology" + f"\\{expt}_diagnostic1\\annot_timeseries.png")
     plt.close(fig)
 
+
+def unit_test_pursuit_model(pursuit_model, params, tau, step_sizes=5):
+    cardinal_directions = [1+0j, 1+1j, 0+1j, -1+1j, -1+0j, -1-1j, 0-1j, 1-1j]
+    fig, axes = plt.subplots(1,8, figsize=(20, 2.5))
+    
+    for count, cardinal in enumerate(cardinal_directions):
+        
+        agent_init_position = -20 + 25j
+
+        # heading depends on initial position and has to be pointing toward target
+        agent_initial_heading = (0+0j) - agent_init_position
+        
+        target_positions = cardinal * np.arange(100) + cardinal
+        agent_step_sizes = np.ones_like(target_positions, dtype=float) * step_sizes
+        pos = target_positions.copy()
+        
+        experimental_data = (agent_initial_heading, agent_init_position, agent_step_sizes, target_positions, pos) 
+        xy, agent_vectors = pursuit_model(params, experimental_data[:-1], tau)
+
+        plot_traintracks(np.array(xy), np.array(target_positions), axes[count], crossties=True)
+    return fig, axes, xy, agent_vectors
+
+
+
+def plot_D_r(res, Phi, axes, labelD, labelr):
+    if type(res) == scipy.optimize._optimize.OptimizeResult:
+        if len(res.x) == 4:
+            D_sigma, D_A, r_sigma, r_A = res.x
+        elif len(res.x) == 2:
+            # Here's why this isn't insane. We will clear and turn off the appropriate axis.
+            D_sigma, D_A = res.x
+            r_sigma, r_A = res.x
+        else:
+            raise ValueError("OptimizeResult must have 2 or 4 elements")
+    elif type(res) == np.ndarray:
+        D_sigma, D_A, r_sigma, r_A = res
+    axes[0].scatter(Phi, D(D_sigma, D_A, Phi),s=2, label=labelD)
+    axes[1].scatter(Phi, r(r_sigma, r_A, Phi),s=2, label=labelr)
+
+    X = np.linspace(-180, 180, 1000)
+    axes[0].plot(X, D(D_sigma, D_A, X),  color="grey", zorder=-np.inf)
+    axes[1].plot(X, r(r_sigma, r_A, X),  color="grey", zorder=-np.inf)
+    
+    axes[0].set(xlabel="$\Phi$ (deg)", ylabel="$D(\Phi)$")
+    axes[1].set(xlabel="$\Phi$ (deg)", ylabel="$r(\Phi)$")
+    
+    for ax in axes.flatten():
+        if np.sum(np.abs(ax.get_ylim())) < 1e-5:
+            ax.set_ylim((-1, 1))
+
+    if labelD is not None:
+        axes[0].legend(handletextpad=0.1)
+    
+    if labelr is not None:
+        axes[1].legend(handletextpad=0.1)
+
+
+def plot_k_N(res, Phi, axes, labelk, labelN):
+    if type(res) == scipy.optimize._optimize.OptimizeResult:
+        if len(res.x) == 2:
+            k, N = res.x
+        else:
+            raise ValueError("OptimizeResult must have 2 or 4 elements")
+    elif type(res) == np.ndarray:
+        k, N = res
+
+    
+    axes[0].scatter(Phi, k * Phi, s=2, label=labelk)
+    axes[1].scatter(Phi, N * np.ones_like(Phi), s=2, label=labelN)
+
+    X = np.linspace(-180, 180)
+    axes[0].plot(X, k * X,  color="grey", zorder=-np.inf)
+    axes[1].plot(X, N * np.ones_like(X),  color="grey", zorder=-np.inf)
+    
+    axes[0].set(xlabel="$\Phi$ (deg)", ylabel="$k \Phi$")
+    axes[1].set(xlabel="$\Phi$ (deg)", ylabel="$N$")
+    
+    for ax in axes.flatten():
+        if np.sum(np.abs(ax.get_ylim())) < 1e-5:
+            ax.set_ylim((-1, 1))
+
+    if (labelk is not None) and (labelN is not None):
+        [ax.legend(handletextpad=0.1) for ax in axes]
+
+
+def plot_contrib_trace(t_df, res, contrib_axes, model_name, model_sobriquet):
+    """Contributions of D and r components
+    Parameters
+    ----------
+    t_df : pd.DataFrame
+        dataframe with thetadot, Phidot, Phidot, alphadot
+    res : scipy.optimize._optimize.OptimizeResult
+        result of the optimization
+    contrib_axes : list
+        list of axes to plot D, r, and prediction
+    model_name : str
+        model name, e.g. r"$D(\Phi) + r(\Phi)\dot{\Phi}$",
+    model_sobriquet : str
+        model sobriquet  e.g.  "D + r Phidot"
+    """
+    thetadot = t_df.thetadot.values
+    t_Phi, t_Phidot, t_alphadot = t_df.Phi.values, t_df.Phidot.values, t_df.alphadot.values
+    model_fun_d = {
+            "D + r Phidot": lambda x, t_Phi=t_Phi, t_Phidot=t_Phidot: get_thetadot_PR(t_Phi, t_Phidot, *x),
+            "D + r alphadot": (lambda x, t_Phi=t_Phi, t_alphadot=t_alphadot: get_thetadot_PR(t_Phi, t_alphadot, *x)),
+            "D": lambda x, t_Phi=t_Phi: D(*x, t_Phi),
+            "r Phidot": lambda x, t_Phi=t_Phi, t_Phidot=t_Phidot: r(*x, t_Phi) * t_Phidot,
+            "r alphadot":lambda x, t_Phi=t_Phi, t_alphadot=t_alphadot: r(*x, t_Phi) * t_alphadot,
+            "linear Phidot": lambda x, t_Phi=t_Phi, t_Phidot=t_Phidot:     x[0] * t_Phi + x[1] * t_Phidot,
+            "linear alphadot": lambda x, t_Phi=t_Phi, t_alphadot=t_alphadot: x[0] * t_Phi + x[1] * t_alphadot}
+    
+    model_fun = model_fun_d[model_sobriquet]
+    is_Phidot = r"\dot{\Phi}" in model_name
+
+    dot_var = t_Phidot if is_Phidot else t_alphadot
+
+    x_t = np.arange(len(t_df)) / 30.01
+
+    contrib_axes[0].plot(x_t, t_Phi, color="blue")
+    contrib_axes[1].plot(x_t, dot_var, color="c")
+    
+    contrib_axes[2].plot(x_t, thetadot, label=r"$\dot{\theta}$ ground truth", color="grey")
+    contrib_axes[2].plot(x_t, model_fun(res.x), label=f"prediction", linewidth=1, color="r")
+
+    # Plot D component only if D is not already the whole function, because otherwise the number of parameters would not match correctly
+    if "D" in model_sobriquet and "r" in model_sobriquet:
+        contrib_axes[2].plot(
+            x_t, D(*res.x[:2], t_Phi), label=r"$r\dot{\Phi}$" if is_Phidot else r"$r\dot{\alpha}$",
+            linewidth=1, color="b")
+    
+    # Plot r component only if R is not already the whole function. 
+    # That means, you check if D is in the function. more complicated than the previous one.
+    if "r" in model_sobriquet and "D" in model_sobriquet:
+        contrib_axes[2].plot(x_t, r(*res.x[2:], t_Phi) * dot_var, label=f"D", linewidth=1, color="g")
+    
+    tau, tau1 = t_df.tau.values[0], t_df.tau1.values[0]
+    contrib_axes[0].set(ylabel=r"$\Phi$ (deg)", title=f"{model_name} $\\tau$:{tau}, $\\tau1$:{tau1}")
+    contrib_axes[1].set(ylabel=r"$\dot{\Phi}$ (deg/s)" if is_Phidot else r"$\dot{\alpha}$", xlabel="Time (s)")
+    contrib_axes[2].set(ylabel=r"$\dot{\theta}$ (deg/s)")
+    contrib_axes[2].legend()
