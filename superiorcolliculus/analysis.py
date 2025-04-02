@@ -9,6 +9,9 @@ from scipy.optimize import minimize
 import re
 from collections import deque
 from datetime import datetime
+from numba import njit, int32, float64
+from numba.experimental import jitclass
+import numpy as np
 
 #%%
 # Generate histogram of speeds
@@ -52,7 +55,7 @@ def get_video_duration(filename):
     
     # Check if the video file was opened successfully
     if not cap.isOpened():
-        print("Error: Couldn't open the video file.")
+        # ("Error: Couldn't open the video file.")
         return None
     
     # Get the frames per second
@@ -113,12 +116,13 @@ def fill_nans_with_interpolation(arr):
     
     return arr
 
-
-def get_Phi_alpha(vector, coord, target_coord):
+'''
+@njit(cache=True)
+def get_Phi_alpha(theta:np.complex128, coord:np.complex128, target_coord:np.complex128):
     """
     Parameters
     ----------
-    vector: (complex) heading
+    theta: (complex) heading
     coord: (complex) position
     target_coord: (complex) target position
 
@@ -126,15 +130,124 @@ def get_Phi_alpha(vector, coord, target_coord):
     -------
     Phi: bearing
     alpha: LOS
-    """    
+    """
     # Update bearing
-    theta = np.angle(vector, deg=True) # deg
-    alpha = np.angle(target_coord - coord, deg=True) # deg
-    Phi = get_angular_difference(np.array([theta]), np.array([alpha]))[0] # deg
+    alpha = target_coord - coord # deg
+    Phi = get_angular_difference(np.complex128(theta), np.complex128(alpha)) # deg
+    return Phi, alpha
+'''
+
+# ---- CircularQueue ----
+spec = [
+    ('maxlen', int32),
+    ('index', int32),
+    ('full', int32),
+    ('data', float64[:, :])
+]
+
+@jitclass(spec)
+class CircularQueue:
+    def __init__(self, maxlen):
+        self.maxlen = maxlen
+        self.index = 0
+        self.full = 0
+        self.data = np.zeros((maxlen, 1))
+
+    def append(self, item):
+        self.data[self.index, 0] = item
+        self.index = (self.index + 1) % self.maxlen
+        if self.index == 0:
+            self.full = 1
+
+    def get(self):
+        if self.full == 0:
+            return self.data[:self.index, 0]
+        else:
+            out = np.empty(self.maxlen, dtype=np.float64)
+            out[:self.maxlen - self.index] = self.data[self.index:, 0]
+            out[self.maxlen - self.index:] = self.data[:self.index, 0]
+            return out
+
+@njit(cache=True)
+def get_Phi_alpha(theta_complex, coord_complex, target_coord_complex):
+    theta = np.degrees(np.angle(theta_complex))
+    alpha = np.degrees(np.angle(target_coord_complex - coord_complex))
+    Phi = get_angular_difference(theta, alpha)
     return Phi, alpha
 
 
-def guidance_law(parameters, experimental_data, tau, tau1, nav_fun):
+@njit(cache=True)
+def par_nav_dtheta_dt(Phi_queue, alpha_queue, params):
+    N, = params
+    alpha_vals = alpha_queue.get()
+    if len(alpha_vals) > 1:
+        dalpha_dt = (alpha_vals[1] - alpha_vals[0])  # simple diff
+        dtheta_dt = N * dalpha_dt
+    else:
+        dtheta_dt = 0.0
+    return dtheta_dt
+
+@njit(cache=True)
+def prop_pursuit_dtheta_dt(Phi_queue, alpha_queue, params):
+    k, = params
+    alpha_vals = alpha_queue.get()
+    Phi_vals = Phi_queue.get()
+    if len(alpha_vals) > 1:
+        dalpha_dt = (alpha_vals[1] - alpha_vals[0])
+        dtheta_dt = dalpha_dt - k * Phi_vals[0]
+    else:
+        dtheta_dt = 0.0
+    return dtheta_dt
+
+# ---- Guidance Law ----
+
+@njit
+def guidance_law(parameters, experimental_data, tau, tau1, mode):
+    tau = int(tau)
+    tau1 = int(tau1)
+
+    initial_heading, initial_position, step_sizes, target_positions = experimental_data
+
+    n_steps = len(target_positions) - tau - tau1
+    vectors = np.zeros(n_steps + 1, dtype=np.complex128)
+    coords = np.zeros(n_steps, dtype=np.complex128)
+
+    vectors[0] = initial_heading
+    coords[0] = initial_position
+
+    theta = np.degrees(np.angle(initial_heading))
+
+    initial_Phi, initial_alpha = get_Phi_alpha(initial_heading, initial_position, target_positions[0])
+
+    Phi_queue = CircularQueue(tau + 2)
+    alpha_queue = CircularQueue(tau1 + 2)
+    Phi_queue.append(initial_Phi)
+    alpha_queue.append(initial_alpha)
+
+    for i in range(n_steps):
+        target_position = target_positions[i]
+        step_size = step_sizes[i]
+
+        if mode == 0:
+            dtheta_dt = par_nav_dtheta_dt(Phi_queue, alpha_queue, parameters)
+        else:
+            dtheta_dt = prop_pursuit_dtheta_dt(Phi_queue, alpha_queue, parameters)
+
+        theta = (theta + dtheta_dt) % 360.0
+
+        vector = step_size * np.exp(1j * np.deg2rad(theta))
+        vectors[i + 1] = vector
+        coords[i] = coords[i - 1] + vector if i > 0 else initial_position + vector
+
+        Phi, alpha = get_Phi_alpha(vector, coords[i], target_position)
+        Phi_queue.append(Phi)
+        alpha_queue.append(alpha)
+
+    return coords, vectors
+
+'''
+@njit
+def guidance_law(parameters, experimental_data, tau, tau1, mode):
     """
     Note: because the deque is not filled initially, the first two dalpha_dt values will be the same.
     May want to address that by adding more data to the initial values possibly from BEFORE the bout starts. 
@@ -145,95 +258,55 @@ def guidance_law(parameters, experimental_data, tau, tau1, nav_fun):
     ----------
     experimental_data : Initial heading (complex), initial coordinates (complex), step_sizes (np.array), target_coordinates (complex np.array)
     parameters: (float, float, int) k, beta tau; negative gain parameter, constant bearing, and time delay"""
-    from numba import njit
-    # Unpack parameters
-    if type(tau) != int:
-        tau = int(tau)
-        tau1 = int(tau1)
-
+    tau = int(tau)
+    tau1 = int(tau1)
+    
     initial_heading, initial_position, step_sizes, target_positions = experimental_data
-    vectors, coords = [initial_heading], [initial_position]
+    # NEW
+    n_steps = len(target_positions) - tau - tau1
+    vectors, coords =  np.zeros((n_steps + 1, 1), dtype=np.complex128), np.zeros((n_steps, 1), dtype=np.complex128)
+    vectors[0], coords[0] = initial_heading, initial_position
     
     # taking 1st instead of 0th because 0th is just used for computing derivative.
     # We do this because sometimes we input the first `tau` values
 
-    theta = np.angle(initial_heading[1] if hasattr(initial_heading, '__len__') else initial_heading, deg=True) 
+    theta = np.degrees(np.angle(initial_heading[1] if hasattr(initial_heading, '__len__') else initial_heading) )
 
     initial_Phi, initial_alpha = get_Phi_alpha(initial_heading, initial_position, 
         target_positions[:len(initial_position) if hasattr(initial_position, '__len__') else 1])
 
-    Phi_queue =   deque(initial_Phi, maxlen=tau+2)
-    alpha_queue = deque(initial_alpha, maxlen=tau1+2)
+    Phi_queue = CircularQueue(tau+2)
+    alpha_queue = CircularQueue(tau1+2)
+    Phi_queue.append(initial_Phi)
+    alpha_queue.append(initial_alpha)
+    for i in range(n_steps):
+        target_position = target_positions[i] # +tau+au1? I don't think so.
+        step_size = step_sizes[i] #  + tau + tau1? I don't think so
 
-    for target_position, step_size in zip(target_positions[tau:],  step_sizes[tau:]):    
-        # TODO in debug: Check that the vectors and coords at time t are not ZEROs
-        
         # Update heading based on previous direction
         # Taking the first Phi value because two values are needed to calculate the derivative
         # But only one value is needed to calculate the bearing. Thus the first value is ignored when not taking the derivative.
         # This is because the second value is the last value from the previous timestep, with tau delay.
-        dtheta_dt = nav_fun(Phi_queue, alpha_queue, parameters)
+        if mode == 0:
+            dtheta_dt = par_nav_dtheta_dt(Phi_queue, alpha_queue, parameters)
+        elif mode == 1:
+            dtheta_dt = prop_pursuit_dtheta_dt(Phi_queue, alpha_queue, parameters)
         theta = (theta + dtheta_dt) % 360 # deg
         
-        # Complex
-        vectors.append(step_size * phasor(theta))
-        coords.append(coords[-1] + vectors[-1])
+        # Complex, replaced phasor() with the hard code.
+        vector = step_size * np.exp(1j * np.deg2rad(theta))
+        vectors[i] = vector
+        coords[i+1] = coords[i] + vector
 
         # Appending pops the beginning of the array, so append after evaluting thetadot for the first time.
         # Only update the queue after the initial run so that there is not a fictive delay.
-        Phi, alpha = get_Phi_alpha(vectors[-1], coords[-1], target_position)
+        Phi, alpha = get_Phi_alpha(vector, coords[i+1], target_position)
         Phi_queue.append(Phi)
         alpha_queue.append(alpha)
 
     # all but the last coordinate so that it's the 
     return coords[:-1-tau], vectors[:-1-tau]
-
-def par_nav(parameters, experimental_data, tau, tau1):
-    """Parameters
-    ----------
-    experimental_data : Initial heading (complex), initial coordinates (complex), step_sizes (np.array), target_coordinates (complex np.array)
-    parameters: (float, int) N, tau; negative gain parameter and time delay"""
-    def par_nav_dtheta_dt(Phi_queue, alpha_queue, params): 
-        N, = params
-        if len(alpha_queue) > 1:
-            # dPhi_dt = dangle_dt(np.array(Phi_queue))  # deg/frame
-            # dtheta_dt = N * dPhi_dt[0]
-            dalpha_dt = dangle_dt(np.array(alpha_queue)) # deg/frame
-            dtheta_dt = N * dalpha_dt[0]
-            # print(list(Phi_queue), dPhi_dt, dtheta_dt)
-        else:
-            dtheta_dt = 0
-        return dtheta_dt
-
-    coords, vectors = guidance_law(parameters, experimental_data, tau, tau1, par_nav_dtheta_dt)
-    return coords, vectors
-
-
-def prop_pursuit(parameters, experimental_data, tau, tau1):
-    """
-    Note: because the deque is not filled initially, the first two dalpha_dt values will be the same.
-    May want to address that by adding more data to the initial values possibly from BEFORE the bout starts. 
-    Yeah, the solution is to add two initial values to the deque from before the bout starts I think.
-    That way, even if tau is 0, the deque will have two values to calculate the derivative from.
-
-    Parameters
-    ----------
-    experimental_data : Initial heading (complex), initial coordinates (complex), step_sizes (np.array), target_coordinates (complex np.array)
-    parameters: (float, float) k, beta; negative gain parameter, constant bearing, and time delay"""
-
-    def prop_pursuit_dtheta_dt(Phi_queue, alpha_queue, params):
-        k, = params
-        if len(alpha_queue) > 1:
-            dalpha_dt = dangle_dt(np.array(alpha_queue)) # deg/frame
-            dtheta_dt = dalpha_dt[0] - k * ( Phi_queue[0]) # deg
-            # print(list(alpha_queue), list(Phi_queue), dalpha_dt, dtheta_dt)
-        else:
-            dtheta_dt = 0
-        return dtheta_dt
-    coords, vectors = guidance_law(parameters, experimental_data, tau, tau1, prop_pursuit_dtheta_dt)
-    return coords, vectors
-
-
+'''
 def D(sigma, A, Phi):
     """First term, direction sensitivity term"""
     Phi = np.deg2rad(Phi)
@@ -297,7 +370,6 @@ def get_datetime_from_avi(avi_file):
     # Find the match
     match = re.search(regex, avi_file)
 
-    # Print the result
     if match:
         dtstr = match.group(1)  # Extracting the specific capture group
         dt = np.datetime64(datetime.strptime(dtstr, '%m%d%Y%H%M%S'))
@@ -309,11 +381,13 @@ def get_datetime_from_avi(avi_file):
 def get_VAF(prediction, ground_truth):
     return 1-((np.var(prediction - ground_truth) / np.var(ground_truth)))
 
+
 def MAE(prediction, ground_truth):
     """Mean absolute error"""
     # Calculate the mean absolute error (MAE)
     mae = np.mean(np.abs(prediction - ground_truth))
     return mae
+
 
 def MSE(prediction, ground_truth):
     """Mean squared error"""
@@ -321,41 +395,50 @@ def MSE(prediction, ground_truth):
     mse = np.mean((prediction - ground_truth)**2)
     return mse
 
-def cost(params, experimental_data, pursuit_model, tau:int, tau1:int):
-    '''Example useage:'''
-    # Get predicted data
-    # print(params)
-    predicted_data, _ = pursuit_model(params, experimental_data[:-1], tau, tau1)
-    # MAE
-    error = MAE(predicted_data, experimental_data[-1])
-    # print(error)
-    return error
 
-
-# def aggregate_cost(params, experimental_data_l, pursuit_model, tau, tau1):
-#     '''Example useage:
-#     result = minimize(aggregate_cost, initial_guess, args=(experimental_data_l, constant_bearing_interception_pursuit), method='Nelder-Mead')
-#     prop_pursuit_k_optimized, prop_pursuit_tau_optimized = result.x
-#     '''
-#     total_error = 0
-#     for experimental_data in experimental_data_l:
-#         total_error += cost(params, experimental_data, pursuit_model, tau, tau1)
-#     return total_error
 from concurrent.futures import ProcessPoolExecutor
-
 def compute_cost(args):
     """Helper function to make cost picklable."""
-    params, experimental_data, pursuit_model, tau, tau1 = args
-    return cost(params, experimental_data, pursuit_model, tau, tau1)
+    return cost(*args)
 
-def aggregate_cost(params, experimental_data_l, pursuit_model, tau, tau1, max_workers=4):
+
+"""def aggregate_cost(params, experimental_data_l, tau, tau1, mode, max_workers=4):
     '''Parallelized version of aggregate_cost with constrained CPU usage.'''
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        errors = executor.map(compute_cost, [(params, data, pursuit_model, tau, tau1) for data in experimental_data_l])
+        errors = executor.map(compute_cost, [(params, data, tau, tau1, mode) for data in experimental_data_l])
     error_l = list(errors)
     total_avg_error = np.mean(error_l)
-    print(int(total_avg_error), np.std(error_l).astype(int), params, tau, tau1, pursuit_model)
     return np.mean(error_l)
+"""
+
+
+def aggregate_cost(params, experimental_data_l, tau, tau1, mode):
+    '''Example useage:
+    result = minimize(aggregate_cost, initial_guess, args=(experimental_data_l, constant_bearing_interception_pursuit), method='Nelder-Mead')
+    prop_pursuit_k_optimized, prop_pursuit_tau_optimized = result.x
+    '''
+    error_l = []
+    for experimental_data in experimental_data_l:
+        error_l.append(cost(params, experimental_data, tau, tau1, mode))
+    # print(int(np.mean(error_l)), np.std(error_l).astype(int), params, tau, tau1, mode)
+
+    return np.mean(error_l)
+
+
+def cost(params, experimental_data, tau:int, tau1:int, mode:int):
+    '''Example useage:'''
+    # Get predicted data
+    # print('params type:', type(params))
+    # print('experimental_data types:', [type(e) for e in experimental_data])
+    # print('experimental_data dtypes:', [getattr(e, 'dtype', None) for e in experimental_data])
+    # print('tau type:', type(tau))
+    # print('tau1 type:', type(tau1))
+    # print('mode type:', type(mode))
+    predicted_data, _ = guidance_law(params, experimental_data[:-1], tau, tau1, mode)
+    # MAE
+    # print(tau, tau1, predicted_data.shape, experimental_data[-1][:-tau if tau > 0 else None].shape)
+    error = MAE(predicted_data, experimental_data[-1])
+    return error
 
 
 def get_guidance_law_df(experimental_data_l:list, pursuit_model:str,  initial_guess:tuple, tau:int, tau1:int):
@@ -367,7 +450,7 @@ def get_guidance_law_df(experimental_data_l:list, pursuit_model:str,  initial_gu
         'classic_pursuit':
         'constant bearing':
         'proportional pursuit':
-        'proportional navigation': 
+        'proportional navigation':
         'mixed_pursuit':
     initial_guess: (tuple) Initial guess for parameters
     tau(1): (int) tau for the model. tau is the time delay for the model.
@@ -378,31 +461,18 @@ def get_guidance_law_df(experimental_data_l:list, pursuit_model:str,  initial_gu
     parameter_df: (pd.DataFrame) Dataframe containing the optimized parameters
     """
 
-
     """Parameters for each model
     prop_pursuit: (k, beta)
     par_nav: (N)"""
-    model_constaints_d = {
-        'classic pursuit':        (prop_pursuit, [{"type":"eq", "fun": lambda initial_guess: initial_guess[0]-1},
-                                                  {"type":"eq", "fun": lambda initial_guess: initial_guess[1]}]),
-        'constant bearing':       (prop_pursuit, [{ "type":"eq", "fun": lambda initial_guess: initial_guess[0]-1}]),
-        # This ensures the first parameter is greater than 0 (x[0] > 0)
-        'proportional pursuit':   (prop_pursuit,  [{"type":"ineq", "fun": lambda initial_guess: initial_guess[0]-0.0001},
-                                                   {"type":"eq", "fun": lambda initial_guess: initial_guess[1]}]),
-        'proportional navigation':(par_nav, None),
-        'mixed_pursuit':(None, )
-    }
-    
-    # Select pursuit model and constraints
-    pursuit_model_fun, constraints = model_constaints_d[pursuit_model]
+
+    if pursuit_model == "proportional pursuit":
+        mode=0
+    elif pursuit_model == "proportional navigation":
+        mode=1
 
     # Optimize
-    result = minimize(
-        aggregate_cost,
-        initial_guess,
-        args=(experimental_data_l, pursuit_model_fun, tau, tau1),
-        method='Powell') # constraints=constraints,
-
+    result = minimize(aggregate_cost, initial_guess, args=(experimental_data_l, tau, tau1, mode), method='Powell') 
+    # print(result.x, result.success, result.nit, result.message)
     # Add datetime metadata.
     parameter_df = pd.DataFrame(
         {"param":result.x, "result":result, 
@@ -584,7 +654,7 @@ def add_two_delays(df, Phi_tau, Phidot_tau):
     output_df = df.copy().iloc[tau:]
     output_df["Phi"] = Phi
     output_df["Phidot"] = Phidot
-    output_df["alphadot"] = alphadot   
+    output_df["alphadot"] = alphadot
 
     return output_df
     

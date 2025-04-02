@@ -8,6 +8,7 @@ import warnings
 import os
 import scipy.io
 import scipy.ndimage as nd
+from numba import njit
 
 from .analysis import *
 
@@ -65,32 +66,32 @@ def phasor(angle):
     """Angle in degrees"""
     return np.exp(1j * np.deg2rad(angle))
 
-
+@njit
 def get_angular_difference(u, v):
     """
     Parameters
     ----------
-    u, v: np.array (complex numbers)
+    u, v: np.complex128
         Unit phasors representing angles
     Returns
     -------
     np.array (angles, in degrees)
         The angular difference between the phasors in degrees
     """
-    assert type(u) == type(v), "Both inputs must be the same type"
-    
-    if not np.iscomplexobj(u):
-        u = phasor(u)
-    if not np.iscomplexobj(v):
-        v = phasor(v)   
 
-    u = u / np.abs(u)
-    v = v / np.abs(v)
     # Compute the difference using division of complex numbers
-    difference_phasor = u / v
-    
+    eps = 1e-12
+    u_norm = np.abs(u)
+    v_norm = np.abs(v)
+
+    if u_norm < eps or v_norm < eps:
+        return 0.0  # or np.nan, or raise a controlled exception
+
+    u = u / u_norm
+    v = v / v_norm
     # Calculate the angle of the resulting phasor in degrees
-    angular_difference = np.angle(difference_phasor, deg=True)
+    difference_phasor = u / v
+    angular_difference = (180.0 / np.pi) * np.angle(difference_phasor)
 
     return angular_difference
 
