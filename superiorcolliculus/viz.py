@@ -481,29 +481,40 @@ def plot_behavior_bout(generator_vars, cmap_name="nipy_spectral"):
     return fig, axes
 
 
-def plot_traintracks(pos, target_positions, ax, crossties=0):
+def plot_traintracks(
+    pos, target_positions, ax, crossties=0,
+    pos_label="pursuer", target_label="target",
+    xtie_kwargs={}, pos_kwargs={}, target_kwargs={}):
+    """
+    Parameters
+    ----------
+    pos: (np.ndarray) Array of complex numbers representing the position of the pursuer at each time step.
+    target_positions: (np.ndarray) Array of complex numbers representing the position of the target at each time step.
+    ax: (matplotlib.axes.Axes) The axis on which to plot the train tracks.
+    crossties: (int) If > 0, plot dashed lines (crossties) between the pursuer and target at every crossties-th time step.
+        Set to 0 to disable crossties.
+    pos_label: (str) Label for the pursuer's trajectory in the legend.
+    
+    """
     assert np.iscomplexobj(pos)
     assert np.iscomplexobj(target_positions)
     
-    plot_kwargs = {"alpha":1, "linewidth":2}
     # Plot position of target
-    ax.plot(target_positions.real, target_positions.imag, c="orange", **plot_kwargs, label="target")
-    ax.plot(target_positions.real[0], target_positions.imag[0], c="orange", **plot_kwargs, marker="o")
+    ax.plot(target_positions.real, target_positions.imag, **target_kwargs)
+    ax.plot(target_positions.real[0], target_positions.imag[0], marker="o", label=target_label, **target_kwargs)
 
     # Plot ground truth for pursuer
-    ax.plot(pos.real, pos.imag, c="b", **plot_kwargs,label="pursuer")
-    ax.plot(pos.real[0], pos.imag[0], c="b", **plot_kwargs, marker="o")
+    ax.plot(pos.real, pos.imag, label=pos_label, **pos_kwargs)
+    ax.plot(pos.real[0], pos.imag[0], marker="o", **pos_kwargs)
 
     if crossties:
         for xtie_ind in np.arange(0, len(pos), crossties):
             ax.plot(
                 [pos.real[xtie_ind], target_positions.real[xtie_ind]],
                 [pos.imag[xtie_ind], target_positions.imag[xtie_ind]],
-                c="k", alpha=0.3, linestyle="dashed")
+                c="k", alpha=0.3, linestyle="dashed", **xtie_kwargs)
             
             
-    # ax.legend()
-
 
 """Neuropixel"""
 from matplotlib import cm
@@ -595,7 +606,7 @@ def plot_zoomed_annot_timeseries(recording, sorting, unit_df, expt, tr1=[2, 3], 
     plt.close(fig)
 
 
-def unit_test_pursuit_model(pursuit_model, params, tau, step_sizes=5):
+def unit_test_pursuit_model(mode, params, tau, step_sizes=5):
     cardinal_directions = [1+0j, 1+1j, 0+1j, -1+1j, -1+0j, -1-1j, 0-1j, 1-1j]
     fig, axes = plt.subplots(1,8, figsize=(20, 2.5))
     
@@ -611,7 +622,7 @@ def unit_test_pursuit_model(pursuit_model, params, tau, step_sizes=5):
         pos = target_positions.copy()
         
         experimental_data = (agent_initial_heading, agent_init_position, agent_step_sizes, target_positions, pos) 
-        xy, agent_vectors = pursuit_model(params, experimental_data[:-1], tau)
+        xy, agent_vectors = guidance_law(params, experimental_data[:-1], tau, tau, mode)
 
         plot_traintracks(np.array(xy), np.array(target_positions), axes[count], crossties=True)
     return fig, axes, xy, agent_vectors
