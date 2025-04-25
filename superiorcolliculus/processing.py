@@ -66,34 +66,63 @@ def phasor(angle):
     """Angle in degrees"""
     return np.exp(1j * np.deg2rad(angle))
 
+# @njit
+# def get_angular_difference(u, v):
+#     """
+#     Parameters
+#     ----------
+#     u, v: np.complex128
+#         Unit phasors representing angles
+#     Returns
+#     -------
+#     np.array (angles, in degrees)
+#         The angular difference between the phasors in degrees
+#     """
+
+#     # Compute the difference using division of complex numbers
+#     eps = 1e-12
+#     u_norm = np.abs(u)
+#     v_norm = np.abs(v)
+#     """old"""
+#     if u_norm < eps or v_norm < eps:
+#         return np.array([0.0])  # or np.nan, or raise a controlled exception
+#     """old"""
+
+#     """new"""
+#     u_norm(np.where(u_norm < eps)) = eps
+#     v_norm(np.where(v_norm < eps)) = eps
+#     """new"""
+
+#     u = u / u_norm
+#     v = v / v_norm
+#     # Calculate the angle of the resulting phasor in degrees
+#     difference_phasor = u / v
+#     angular_difference = (180.0 / np.pi) * np.angle(difference_phasor)
+
+#     return angular_difference # deg
 @njit
-def get_angular_difference(u, v):
-    """
-    Parameters
-    ----------
-    u, v: np.complex128
-        Unit phasors representing angles
-    Returns
-    -------
-    np.array (angles, in degrees)
-        The angular difference between the phasors in degrees
-    """
-
-    # Compute the difference using division of complex numbers
+def get_angular_difference_scalar(u, v):
     eps = 1e-12
-    u_norm = np.abs(u)
-    v_norm = np.abs(v)
+    unorm = np.abs(u)
+    vnorm = np.abs(v)
+    if unorm < eps or vnorm < eps:
+        return 0.0
+    u /= unorm
+    v /= vnorm
+    return (180.0 / np.pi) * np.angle(u / v)
 
-    if u_norm < eps or v_norm < eps:
-        return 0.0  # or np.nan, or raise a controlled exception
-
-    u = u / u_norm
-    v = v / v_norm
-    # Calculate the angle of the resulting phasor in degrees
-    difference_phasor = u / v
-    angular_difference = (180.0 / np.pi) * np.angle(difference_phasor)
-
-    return angular_difference
+@njit
+def get_angular_difference_array(u, v):
+    eps = 1e-12
+    out = np.empty(len(u))
+    for i in range(len(u)):
+        unorm = np.abs(u[i])
+        vnorm = np.abs(v[i])
+        if unorm < eps or vnorm < eps:
+            out[i] = 0.0
+        else:
+            out[i] = (180.0 / np.pi) * np.angle(u[i] / unorm / (v[i] / vnorm))
+    return out
 
 
 def dangle_dt(angles):
@@ -101,14 +130,14 @@ def dangle_dt(angles):
     Parameters
     ----------
     angles: np.array
-        Angles in degrees
+        Phasors
     Returns
     -------
     np.array (angles in degrees)
         Derivative of angles with respect to time"""
-    assert not np.iscomplexobj(angles), "Angles must be real numbers (degrees), not complex"
+    assert np.iscomplexobj(angles), "Angles must be complex, not degrees"
     assert len(angles) > 1, "Angles must have at least 2 elements"
-    diffs = get_angular_difference(angles[1:], angles[:-1])
+    diffs = get_angular_difference_array(angles[1:], angles[:-1])
     return np.concatenate(([diffs[0]], diffs))
 
 
@@ -468,13 +497,13 @@ def get_relevant_measures(dlc_csv, conversion_rate, use_cv2_target_keypoints=Fal
         body_vector = (neck_x - base_x) + (neck_y - base_y) * 1j
 
         # Egocentric head angle
-        ego_angle = get_angular_difference(head_vector, body_vector)
+        ego_angle = get_angular_difference_array(head_vector, body_vector)
 
         # Allocentric head angle
         head_angle = np.angle(head_vector, deg=True)
 
         # head-target head angle
-        target_bearing = get_angular_difference(LOS, head_vector)
+        target_bearing = get_angular_difference_array(LOS, head_vector)
         
     return {
         'LOS':LOS, 'head_vector':head_vector, 'body_vector':body_vector, 'ego_angle':ego_angle, 'target_bearing':target_bearing,

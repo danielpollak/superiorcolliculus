@@ -12,6 +12,7 @@ from datetime import datetime
 from numba import njit, int32, float64
 from numba.experimental import jitclass
 import numpy as np
+from numpy.linalg import slogdet, inv
 
 #%%
 # Generate histogram of speeds
@@ -152,64 +153,72 @@ def get_Phi_alpha(theta_complex, coord_complex, target_coord_complex):
     theta = np.degrees(np.angle(theta_complex)) 
     alpha = np.degrees(np.angle(target_coord_complex - coord_complex))
     
-    Phi = get_angular_difference(
-        theta_complex,
-        np.exp(1j * np.deg2rad(alpha))
-    )
+    Phi = get_angular_difference_scalar(theta_complex, np.exp(1j * np.deg2rad(alpha)))
 
     return Phi, alpha
 
 
 @njit(cache=True)
 def par_nav_dtheta_dt_alpha(Phi_queue, alpha_queue, params):
-    N, = params
+    N = params[0]
     alpha_vals = alpha_queue.get()
     if len(alpha_vals) > 1:
-        dalpha_dt = (alpha_vals[1] - alpha_vals[0])  # simple diff
+        dalpha_dt = alpha_vals[1] - alpha_vals[0] # simple diff
         dtheta_dt = N * dalpha_dt
     else:
         dtheta_dt = 0.0
     return dtheta_dt
 
 
-@njit
-def PR_dtheta_dt(Phi_queue, alpha_queue, params):
-    """Poggio-Reichart model
-    Parameters
-    ----------
-
-    """
-    N, = params
+@njit(cache=True)
+def par_nav_dtheta_dt_Phi(Phi_queue, alpha_queue, params):
+    N = params[0]
     Phi_vals = Phi_queue.get()
     if len(Phi_vals) > 1:
-        dPhi_dt = (Phi_vals[1] - Phi_vals[0])  # simple diff
+        dPhi_dt = Phi_vals[1] - Phi_vals[0] # simple diff
         dtheta_dt = N * dPhi_dt
     else:
         dtheta_dt = 0.0
-
     return dtheta_dt
+
+
 
 @njit(cache=True)
 def prop_pursuit_dtheta_dt(Phi_queue, alpha_queue, params):
-    k, = params
-    alpha_vals = alpha_queue.get()
+    k = params[0]
+    # alpha_vals = alpha_queue.get()
     Phi_vals = Phi_queue.get()
-    if len(alpha_vals) > 1:
-        dalpha_dt = (alpha_vals[1] - alpha_vals[0])
-        dtheta_dt = dalpha_dt - k * Phi_vals[0]
+    if len(Phi_vals) > 1:
+        # dalpha_dt = (alpha_vals[1] - alpha_vals[0])
+        dtheta_dt = - k * Phi_vals[0] # dalpha_dt - k * Phi_vals[0]
+    else:
+        dtheta_dt = 0.0
+    return dtheta_dt
+
+@njit(cache=True)
+def biased_prop_pursuit_dtheta_dt(Phi_queue, alpha_queue, params):
+    k, beta = params[0], params[1]
+    # alpha_vals = alpha_queue.get()
+    Phi_vals = Phi_queue.get()
+    if len(Phi_vals) > 1:
+        # dalpha_dt = (alpha_vals[1] - alpha_vals[0])
+        dtheta_dt = -k * (Phi_vals[0] + np.sign(Phi_vals[0]) * beta) # dalpha_dt - k * Phi_vals[0]
     else:
         dtheta_dt = 0.0
     return dtheta_dt
 
 # ---- Guidance Law ----
+from numba import njit
+@njit(cache=True)
+def sigmoid(x, x0, k=1):
+    """Sigmoid function"""
+    L = 1 # Maximum value
+
+    return L / (1 + np.exp(-k * (x - x0)))
+
 @njit
 def guidance_law(parameters, experimental_data, tau, tau1, mode):
-    """
-    mode == 0: prop pursuit
-    mode == 1: parallel pursuit
-    mode == 2: Poggio-Reichart
-    mode == 3: Mixed
-    """
+    
     tau = int(tau)
     tau1 = int(tau1)
 
@@ -225,30 +234,58 @@ def guidance_law(parameters, experimental_data, tau, tau1, mode):
     theta = np.degrees(np.angle(initial_heading))
 
     initial_Phi, initial_alpha = get_Phi_alpha(initial_heading, initial_position, target_positions[0])
-
     Phi_queue = CircularQueue(tau + 2)
     alpha_queue = CircularQueue(tau1 + 2)
-    Phi_queue.append(initial_Phi)
-    alpha_queue.append(initial_alpha)
+    [Phi_queue.append(initial_Phi) for _ in range(tau + 2)]
+    [alpha_queue.append(initial_alpha) for _ in range(tau1 + 2)]
 
     for i in range(n_steps):
         target_position = target_positions[i]
         step_size = step_sizes[i]
 
-        if mode == 0:
+        if mode == 0: # Pure proportional pursuit
             dtheta_dt = prop_pursuit_dtheta_dt(Phi_queue, alpha_queue, parameters)
 
-        elif mode == 1:
+        elif mode == 1: # Biased proportional pursuit
+            dtheta_dt = biased_prop_pursuit_dtheta_dt(Phi_queue, alpha_queue, parameters)
+
+        elif mode == 2: # Parallel navigation
             dtheta_dt = par_nav_dtheta_dt_alpha(Phi_queue, alpha_queue, parameters)
 
-        elif mode == 2:
-            Phi_data = Phi_queue.get()
-            dPhi_dt = (Phi_data[1] - Phi_data[0])  # simple diff
-
-            D_sigma, D_A,  r_sigma, r_A = *parameters
-            dtheta_dt = get_thetadot_PR(Phi, dPhi_dt, D_sigma, D_A,  r_sigma, r_A)
+        elif mode == 3: # mixed
+            dtheta_dt = prop_pursuit_dtheta_dt(Phi_queue, alpha_queue, np.array([parameters[0]])) + par_nav_dtheta_dt_alpha(Phi_queue, alpha_queue, np.array([parameters[1]]))
         
+        elif mode == 4:
+            Phi = Phi_queue.get()
+            dPhi_dt = (Phi[1] - Phi[0])  # simple diff
 
+            D_sigma =  parameters[0]
+            D_A =      parameters[1]
+            r_sigma =  parameters[2]
+            r_A =      parameters[3]
+            
+            dtheta_dt = get_thetadot_PR(Phi[0], dPhi_dt, D_sigma, D_A,  r_sigma, r_A)
+        
+        elif mode == 5:
+            alpha = alpha_queue.get()
+            dalpha_dt = (alpha[1] - alpha[0])  # simple diff
+
+            D_sigma =  parameters[0]
+            D_A =      parameters[1]
+            r_sigma =  parameters[2]
+            r_A =      parameters[3]
+            
+            dtheta_dt = get_thetadot_PR(alpha[0], dalpha_dt, D_sigma, D_A,  r_sigma, r_A)
+        elif mode == 6:
+            dtheta_dt = par_nav_dtheta_dt_Phi(Phi_queue, alpha_queue, parameters)
+        elif mode == 7:
+            distance = np.abs(target_position - coords[i]) # distance to target
+            sig = sigmoid(distance, parameters[-1]) 
+
+            PP_contrib = sig * prop_pursuit_dtheta_dt(Phi_queue, alpha_queue, np.array([parameters[0]]))
+            PN_contrib = (1 - sig) * par_nav_dtheta_dt_alpha(Phi_queue, alpha_queue, np.array([parameters[1]]))
+            dtheta_dt = PP_contrib + PN_contrib
+        
 
         theta = (theta + dtheta_dt) % 360.0
 
@@ -257,12 +294,16 @@ def guidance_law(parameters, experimental_data, tau, tau1, mode):
         coords[i] = coords[i - 1] + vector if i > 0 else initial_position + vector
 
         Phi, alpha = get_Phi_alpha(vector, coords[i], target_position)
+        # print("phi", int(Phi), "alpha",int(alpha)%360, "dthetadt",int(dtheta_dt), "theta", int(theta), "vector",int(np.angle(vector, deg=True)%360))
         Phi_queue.append(Phi)
         alpha_queue.append(alpha)
 
     return coords, vectors
 
 
+
+
+@njit(cache=True)
 def D(sigma, A, Phi):
     """First term, direction sensitivity term
     
@@ -272,38 +313,24 @@ def D(sigma, A, Phi):
     A: (float) amplitude of the Gaussian
     Phi: (float) angle in degrees
     """
-    Phi = np.deg2rad(Phi)
+    Phi = 2 * np.pi / 360 * Phi
     return A * Phi / (np.sqrt(2 * np.pi) * sigma**3) * np.exp(-Phi ** 2 / (2 * sigma**2))
 
 
+@njit(cache=True)
 def r(sigma, A, Phi):
     """Second term, angular velocity gain term
     Parameters
     ----------
     sigma: (float) standard deviation of the Gaussian
     A: (float) amplitude of the Gaussian"""
-    Phi = np.deg2rad(Phi)
+    Phi = 2 * np.pi / 360 * Phi
     return A / (np.sqrt(2 * np.pi ) * sigma) * np.exp(-Phi**2/(2*sigma**2))
 
 
+@njit(cache=True)
 def get_thetadot_PR(Phi, Phidot, D_sigma, D_A,  r_sigma, r_A):
     return D(D_sigma, D_A,  Phi) + r(r_sigma, r_A, Phi) * Phidot
-
-
-def PoggioReichart(parameters, experimental_data, tau):
-    """Parameters
-    ----------
-    parameters: (OptimizationResult) res;
-    experimental_data : Initial heading (complex), initial coordinates (complex), step_sizes (np.array), target_coordinates (complex np.array)
-    """
-    def PR_dt(Phi_queue, alpha_queue, res): 
-        dPhi_dt = dangle_dt(np.array(Phi_queue)) # deg/frame
-        dtheta_dt = get_thetadot_PR(Phi_queue[1], dPhi_dt[0], *res.x)
-        return dtheta_dt
-
-    coords, vectors = guidance_law(parameters, experimental_data, tau, PR_dt)
-
-    return coords, vectors
 
 
 # k, b
@@ -327,7 +354,17 @@ def classic_pursuit(parameters, experimental_data, tau, tau1):
     
     return prop_pursuit((1, 0, *parameters), experimental_data, tau, tau1)
 
+def get_experimental_data(event_df):
+    """Assumes data is formatted by PoggioReichart get data function
+    Extracts the relevant experimental data from the event_df that it can be run through the guidance law function"""
 
+    pos = event_df.pos.values
+    agent_initial_heading = event_df.theta.values[0] # complex
+    agent_init_position = pos[0]
+    agent_step_sizes = np.abs(np.diff(pos, prepend=agent_init_position))
+
+    target_positions = event_df.target.values
+    return (agent_initial_heading, agent_init_position, agent_step_sizes, target_positions, pos)
 '''Optimization'''
 def get_datetime_from_avi(avi_file):
 
@@ -345,8 +382,12 @@ def get_datetime_from_avi(avi_file):
         return None
     
 
+def residual_variance(prediction, ground_truth):
+    return np.var(prediction - ground_truth)
+
+
 def get_VAF(prediction, ground_truth):
-    return 1-((np.var(prediction - ground_truth) / np.var(ground_truth)))
+    return 1-((residual_variance(prediction, ground_truth) / np.var(ground_truth)))
 
 
 def MAE(prediction, ground_truth):
@@ -369,14 +410,15 @@ def compute_cost(args):
     return cost(*args)
 
 
-"""def aggregate_cost(params, experimental_data_l, tau, tau1, mode, max_workers=4):
-    '''Parallelized version of aggregate_cost with constrained CPU usage.'''
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        errors = executor.map(compute_cost, [(params, data, tau, tau1, mode) for data in experimental_data_l])
-    error_l = list(errors)
-    total_avg_error = np.mean(error_l)
-    return np.mean(error_l)
-"""
+# def aggregate_cost(params, experimental_data_l, tau, tau1, mode, max_workers=8):
+#     '''Parallelized version of aggregate_cost with constrained CPU usage.'''
+#     with ProcessPoolExecutor(max_workers=max_workers) as executor:
+#         errors = executor.map(compute_cost, [(params, data, tau, tau1, mode) for data in experimental_data_l])
+#     error_l = list(errors)
+#     total_avg_error = np.mean(error_l)
+#     log_cost(params, total_avg_error, tau, tau1, mode)
+
+#     return np.mean(error_l)
 
 
 def aggregate_cost(params, experimental_data_l, tau, tau1, mode):
@@ -393,8 +435,10 @@ def aggregate_cost(params, experimental_data_l, tau, tau1, mode):
 
 
 def cost(params, experimental_data, tau:int, tau1:int, mode:int):
+    """Now trying with VAF instead of error"""
     predicted_data, _ = guidance_law(params, experimental_data[:-1], tau, tau1, mode)
-    error = MAE(predicted_data, experimental_data[-1])
+    # error = MAE(predicted_data, experimental_data[-1])
+    error = 1 - residual_variance(predicted_data, experimental_data[-1])
     return error
 
 
@@ -406,7 +450,7 @@ LOGFILE = None
 
 def init_log(label, tau, tau1,mode):
     global LOGFILE
-    LOGFILE = r"C:\Users\dan\Documents\SuperiorColliculus\data\analysis" + f'\SC{label}_mode{mode}_tau{tau}_tau1{tau1}_log.csv'
+    LOGFILE = r"C:\Users\dan\Documents\SuperiorColliculus\data\log" + f'\SC{label}_mode{mode}_tau{tau}_tau1{tau1}_log.csv'
 
     with open(LOGFILE, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -425,12 +469,7 @@ def get_guidance_law_df(experimental_data_l:list, mode,  initial_guess:tuple, ta
     Parameters
     ----------
     experimental_data: (list of tuples) list of: initial_heading, init_position, step_sizes, target_positions, pos
-    pursuit_model: (str) Pursuit model to fit:
-        'classic_pursuit':
-        'constant bearing':
-        'proportional pursuit':
-        'proportional navigation':
-        'mixed_pursuit':
+    mode: (int) 0: prop pursuit, 1: par nav, 2: Poggio-Reichart, 3: PR alphadot
     initial_guess: (tuple) Initial guess for parameters
     tau(1): (int) tau for the model. tau is the time delay for the model.
         tau1 is the time delay for the model (for the second parameter).
@@ -440,18 +479,13 @@ def get_guidance_law_df(experimental_data_l:list, mode,  initial_guess:tuple, ta
     parameter_df: (pd.DataFrame) Dataframe containing the optimized parameters
     """
 
-    """Parameters for each model
-    prop_pursuit: (k, beta)
-    par_nav: (N)"""
-
-
     # Optimize
     init_log(subject, tau, tau1, mode)
 
     result = minimize(aggregate_cost, initial_guess, args=(experimental_data_l, tau, tau1, mode), method='Powell') 
     # print(result.x, result.success, result.nit, result.message)
     # Add datetime metadata.
-    parameter_df = pd.DataFrame({"param":result.x,"converged": result.success, "nit":result.nit, "error":result.fun}, index=[0])
+    parameter_df = pd.DataFrame({"param":[np.array(result.x)],"converged": result.success, "nit":result.nit, "error":result.fun}, index=[0])
     return parameter_df
 
 
@@ -502,7 +536,6 @@ def get_directional_variables(pos, target_positions, fps, body_angle_vectors=Non
     """
     Returns variables relevant for evaluating navigation models.
     Takes either trajectory-tangent headings or body angle vectors.
-
     
     Parameters
     ----------
@@ -528,24 +561,31 @@ def get_directional_variables(pos, target_positions, fps, body_angle_vectors=Non
     if body_angle_vectors is not None:
         headings = body_angle_vectors
     else:
-        diff_pos = np.diff(pos)
+        diff_pos = np.diff(pos) # complex
         # The first heading is repeated so that the length
         # of headings is the same as the length of pos
-        headings = np.concatenate(([diff_pos[0]], diff_pos))
+        headings = np.concatenate(([diff_pos[0]], diff_pos)) # complex
     
-    headings = np.angle(headings, deg=True)
-    LOS = np.angle(target_positions-pos, deg=True)
+    # Complex
+    LOS = target_positions-pos # complex
 
     # head angle, omega_f, in degrees
     thetadot = dangle_dt(headings) # deg/frame
     thetadot = thetadot / IFI # deg/s
 
     # alphadot
+
     alphadot = dangle_dt(LOS) / IFI # deg/s
 
-    # bearing, theta_e, in degrees
-    phi = get_angular_difference(LOS, headings)
-    phidot = dangle_dt(phi) / IFI # deg/s
+    # bearing, theta_e, in phasor
+    phi = get_angular_difference_array(LOS, headings) # deg
+    phidot = dangle_dt(phasor(phi)) / IFI # deg/s
+
+    assert not np.iscomplexobj(thetadot)
+    assert not np.iscomplexobj(phi)
+    assert not np.iscomplexobj(alphadot)
+    assert not np.iscomplexobj(phidot)
+
     return thetadot, phi, alphadot, phidot
 
 
@@ -740,3 +780,27 @@ def get_data_PoggioReichart(subject_l, tau_phi=0, tau_phidot=0):
 
     return pd.concat(bout_df_l)
 
+
+def compute_aic(residuals, num_params):
+    """Uses an assumption residuals are Gaussian
+    Computes a pseudo-likelihood and plugs it into AIC
+    
+    Parameters
+    ----------
+    residuals : np.ndarray
+        Residuals from a model fit, should be complex numbers
+    num_params : int
+        Number of parameters in the model fit
+    Returns
+    -------
+    float
+        AIC value
+    """
+
+    T = len(residuals)
+    resid_array = np.column_stack([residuals.real, residuals.imag])
+    Sigma = np.cov(residuals.real, residuals.imag)
+    sign, logdet = slogdet(Sigma)
+    quad_form = np.sum(resid_array @ inv(Sigma) * resid_array)
+    log_likelihood = -0.5 * T * logdet - 0.5 * quad_form
+    return 2 * num_params - 2 * log_likelihood

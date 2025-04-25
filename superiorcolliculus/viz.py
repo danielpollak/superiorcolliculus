@@ -413,7 +413,7 @@ def plot_behavior_bout(generator_vars, cmap_name="nipy_spectral"):
         ax.set_title("Target position")
 
     # Euclidian distance between snout and target
-    snout_heading_difference = get_angular_difference(win_target_bearing, win_head_angle)
+    snout_heading_difference = get_angular_difference_array(win_target_bearing, win_head_angle)
 
     # Body directions
     # Length of each vector is unit
@@ -437,7 +437,7 @@ def plot_behavior_bout(generator_vars, cmap_name="nipy_spectral"):
         color=sns.color_palette(cmap_name, n_colors=len(win_neck.real[::2])))
 
     # Get heading inaccuracy from body line to target.
-    body_heading_difference = get_angular_difference(win_target_bearing, np.angle(win_body_vector, deg=True))
+    body_heading_difference = get_angular_difference_array(win_target_bearing, np.angle(win_body_vector, deg=True))
     axes[4].scatter(
         np.arange(len(body_heading_difference)), body_heading_difference, marker="|",
         c=sns.color_palette(cmap_name, n_colors=n_frames))
@@ -504,8 +504,8 @@ def plot_traintracks(
     ax.plot(target_positions.real[0], target_positions.imag[0], marker="o", label=target_label, **target_kwargs)
 
     # Plot ground truth for pursuer
-    ax.plot(pos.real, pos.imag, label=pos_label, **pos_kwargs)
-    ax.plot(pos.real[0], pos.imag[0], marker="o", **pos_kwargs)
+    ax.plot(pos.real, pos.imag,  **pos_kwargs)
+    ax.plot(pos.real[0], pos.imag[0], marker="o",label=pos_label, **pos_kwargs)
 
     if crossties:
         for xtie_ind in np.arange(0, len(pos), crossties):
@@ -513,7 +513,6 @@ def plot_traintracks(
                 [pos.real[xtie_ind], target_positions.real[xtie_ind]],
                 [pos.imag[xtie_ind], target_positions.imag[xtie_ind]],
                 c="k", alpha=0.3, linestyle="dashed", **xtie_kwargs)
-            
             
 
 """Neuropixel"""
@@ -727,8 +726,12 @@ def plot_contrib_trace(t_df, res, contrib_axes, model_name, model_sobriquet):
     contrib_axes[1].plot(x_t, dot_var, color="c")
     
     contrib_axes[2].plot(x_t, thetadot, label=r"$\dot{\theta}$ ground truth", color="grey")
-    contrib_axes[2].plot(x_t, model_fun(res.x), label=f"prediction", linewidth=1, color="r")
+    prediction = model_fun(res.x)
+    contrib_axes[2].plot(x_t, prediction, label=f"prediction", linewidth=1, color="r")
 
+    VAF = get_VAF(thetadot, prediction)
+    error = MAE(thetadot, prediction)
+    plt.suptitle(f"VAF: {VAF:.2f}, MAE: {error:.2f}")
     # Plot D component only if D is not already the whole function, because otherwise the number of parameters would not match correctly
     if "D" in model_sobriquet and "r" in model_sobriquet:
         contrib_axes[2].plot(
