@@ -182,7 +182,6 @@ def par_nav_dtheta_dt_Phi(Phi_queue, alpha_queue, params):
     return dtheta_dt
 
 
-
 @njit(cache=True)
 def prop_pursuit_dtheta_dt(Phi_queue, alpha_queue, params):
     k = params[0]
@@ -194,6 +193,7 @@ def prop_pursuit_dtheta_dt(Phi_queue, alpha_queue, params):
     else:
         dtheta_dt = 0.0
     return dtheta_dt
+
 
 @njit(cache=True)
 def biased_prop_pursuit_dtheta_dt(Phi_queue, alpha_queue, params):
@@ -282,8 +282,18 @@ def guidance_law(parameters, experimental_data, tau, tau1, mode):
             distance = np.abs(target_position - coords[i]) # distance to target
             sig = sigmoid(distance, parameters[-1]) 
 
+            # When Distance is low, we use PN pursuit, when high, we use PP
             PP_contrib = sig * prop_pursuit_dtheta_dt(Phi_queue, alpha_queue, np.array([parameters[0]]))
             PN_contrib = (1 - sig) * par_nav_dtheta_dt_alpha(Phi_queue, alpha_queue, np.array([parameters[1]]))
+            dtheta_dt = PP_contrib + PN_contrib
+
+        elif mode == 8:
+            distance = np.abs(target_position - coords[i]) # distance to target
+            sig = sigmoid(distance, parameters[-1]) 
+
+            # When Distance is low, we use PP, when high, we use PN
+            PP_contrib = (1-sig) * prop_pursuit_dtheta_dt(Phi_queue, alpha_queue, np.array([parameters[0]]))
+            PN_contrib = (sig) * par_nav_dtheta_dt_alpha(Phi_queue, alpha_queue, np.array([parameters[1]]))
             dtheta_dt = PP_contrib + PN_contrib
         
 
@@ -437,8 +447,30 @@ def aggregate_cost(params, experimental_data_l, tau, tau1, mode):
 def cost(params, experimental_data, tau:int, tau1:int, mode:int):
     """Now trying with VAF instead of error"""
     predicted_data, _ = guidance_law(params, experimental_data[:-1], tau, tau1, mode)
-    # error = MAE(predicted_data, experimental_data[-1])
-    error = 1 - residual_variance(predicted_data, experimental_data[-1])
+    error = MAE(predicted_data, experimental_data[-1])
+    # error = 1 - residual_variance(predicted_data, experimental_data[-1])
+    return error
+
+
+
+def aggregate_cost_MSE(params, experimental_data_l, tau, tau1, mode):
+    '''Example useage:
+    result = minimize(aggregate_cost, initial_guess, args=(experimental_data_l, constant_bearing_interception_pursuit), method='Nelder-Mead')
+    prop_pursuit_k_optimized, prop_pursuit_tau_optimized = result.x
+    '''
+    error_l = []
+    for experimental_data in experimental_data_l:
+        error_l.append(cost_MSE(params, experimental_data, tau, tau1, mode))
+    err = np.mean(error_l)
+    log_cost(params, err, tau, tau1, mode)
+    return err
+
+
+def cost_MSE(params, experimental_data, tau:int, tau1:int, mode:int):
+    """Now trying with VAF instead of error"""
+    predicted_data, _ = guidance_law(params, experimental_data[:-1], tau, tau1, mode)
+    error = MSE(predicted_data, experimental_data[-1])
+    # error = 1 - residual_variance(predicted_data, experimental_data[-1])
     return error
 
 
@@ -464,6 +496,41 @@ def log_cost(params, err, tau, tau1, mode):
         writer.writerow([iteration_counter] + list(params) + [err, tau, tau1, mode])
     iteration_counter += 1
 
+
+
+def shorten_experimental_data(experimental_data, start):
+    """Shortens experimental data."""    
+    # Shorten experimental data
+    (initial_heading, init_position, step_sizes, target_positions, pos) = experimental_data
+    
+    # If there's anything left after start time, shorten it and return. Otherwise return None.
+    # This will not run into an indexing error, I believe.
+    if len(target_positions[start:]) > 1:
+        shortened_experimental_data = (np.diff(pos[start:])[0], pos[start], step_sizes[start:], fill_nans_with_interpolation(target_positions[start:]), pos[start:])
+        return shortened_experimental_data
+    else:
+        return None
+
+
+def incremental_guidance_law(experimental_data, guidance_law_params):
+    """Runs get_guidance_law in second-long increments"""
+    # For each increment
+    parameter_df_l = []
+    pos = experimental_data[-1]
+    # Iterate through each start period
+    starts = np.arange(0, min(len(pos), 15), 3)
+    for start_ind, start in enumerate(starts):
+        short_expt_data_l = [shorten_experimental_data(elem, start) for elem in experimental_data if (shorten_experimental_data(elem, start) is not None)]
+
+        parameter_df = get_guidance_law_df(short_expt_data_l, *guidance_law_params)
+        
+        parameter_df["handicap"] = start
+        parameter_df_l.append(parameter_df)
+    
+
+    return pd.concat(parameter_df_l)
+
+
 def get_guidance_law_df(experimental_data_l:list, mode,  initial_guess:tuple, tau:int, tau1:int, subject):
     """Selects guidance law and appropriate constraints to optimize
     Parameters
@@ -476,60 +543,22 @@ def get_guidance_law_df(experimental_data_l:list, mode,  initial_guess:tuple, ta
 
     Returns
     -------
-    parameter_df: (pd.DataFrame) Dataframe containing the optimized parameters
-    """
-
+    parameter_df: (pd.DataFrame) Dataframe containing the optimized parameters"""
     # Optimize
     init_log(subject, tau, tau1, mode)
 
-    result = minimize(aggregate_cost, initial_guess, args=(experimental_data_l, tau, tau1, mode), method='Powell') 
+    resultPowell = minimize(aggregate_cost, initial_guess, args=(experimental_data_l, tau, tau1, mode), method='Powell') 
+    result = minimize(aggregate_cost, resultPowell.x, args=(experimental_data_l, tau, tau1, mode), method='L-BFGS-B', bounds=[(-17,17)] * len(initial_guess), options={"maxls":50}) 
     # print(result.x, result.success, result.nit, result.message)
     # Add datetime metadata.
-    parameter_df = pd.DataFrame({"param":[np.array(result.x)],"converged": result.success, "nit":result.nit, "error":result.fun}, index=[0])
+    parameter_df = pd.DataFrame(
+        {"params":[np.array(result.x)],"converged": result.success, "nit":result.nit,
+        "error":result.fun}, index=[0])
     return parameter_df
 
 
-def shorten_experimental_data(experimental_data, start, interval=30):
-    """Shortens experimental data to a second-long interval"""    
-    # Shorten experimental data
-    (initial_heading, init_position, step_sizes, target_positions, pos) = experimental_data
-    
-    # If there's anything left after start time, shorten it and return. Otherwise return None.
-    # This will not run into an indexing error, I believe.
-    if len(target_positions[start:]) > 1:
-        shortened_experimental_data = (
-            np.diff(pos[start:start+interval])[0],
-            pos[start],
-            step_sizes[start:start+interval],
-            fill_nans_with_interpolation(target_positions[start:start+interval]),
-            pos[start:start+interval])
-    
-        return shortened_experimental_data
-    else:
-        return None
         
 
-def incremental_guidance_law(experimental_data, guidance_law_params, fps):
-    """Runs get_guidance_law in second-long increments"""
-    
-    # For each increment
-    parameter_df_l = []
-
-    pos = experimental_data[-1]
-    # Iterate through each start period
-    starts = np.arange(0, len(pos), 30)
-    for start_ind, start in enumerate(starts):
-        short_expt_data = shorten_experimental_data(experimental_data, start)
-        
-        if (start_ind > 0) and (short_expt_data is None):
-            break
-
-        parameter_df = get_guidance_law_df(short_expt_data, *guidance_law_params)
-        
-        parameter_df["start (s)"] = np.round(start / fps, 2)
-        parameter_df_l.append(parameter_df)
-
-    return pd.concat(parameter_df_l)
 
 
 def get_directional_variables(pos, target_positions, fps, body_angle_vectors=None):
@@ -609,6 +638,7 @@ def get_lagged_design_matrix(predictor, d):
         X[t] = padded_stim[t:t + d]
     # X = np.hstack((np.ones((X.shape[0],1)), X))
     return X
+
 
 
 def crosscorr(x,y):
@@ -739,11 +769,24 @@ def get_data_PoggioReichart(subject_l, tau_phi=0, tau_phidot=0):
 
             tan_thetadot, tan_Phi, alphadot, tan_Phidot = get_directional_variables(pos, target, fps)
             # Filter tangent variables due to their high frequency noise
-            tan_thetadot = scipy.signal.medfilt(tan_thetadot, 5)
+            order = 2
+            W = .2
+            '''tan_thetadot = scipy.signal.filtfilt(
+                *scipy.signal.butter(order, W, btype='lowpass', analog=False, output='ba'),
+                tan_thetadot) if len(tan_thetadot) > 10 else tan_thetadot # because of issues with short bouts
+            tan_Phi = scipy.signal.filtfilt(
+                *scipy.signal.butter(order, W, btype='lowpass', analog=False, output='ba'),
+                tan_Phi) if len(tan_Phi) > 10 else tan_Phi
+            # alphadot = scipy.signal.filtfilt(*scipy.signal.butter(order, W, btype='lowpass', analog=False, output='ba'),alphadot) if len(alphadot) > 10 else alphadot
+            tan_Phidot = scipy.signal.filtfilt(
+                *scipy.signal.butter(order, W, btype='lowpass', analog=False, output='ba'),
+                tan_Phidot) if len(tan_Phidot) > 10 else tan_Phidot'''
+            tan_thetadot = scipy.signal.medfilt(tan_thetadot, 5)# because of issues with short bouts
             tan_Phi = scipy.signal.medfilt(tan_Phi, 5)
             alphadot = scipy.signal.medfilt(alphadot, 5)
-            tan_Phidot = scipy.signal.medfilt(tan_Phidot, 5)
+            tan_Phidot = scipy.signal.medfilt(tan_Phidot)
             
+
             bout_df = pd.DataFrame(
                 {"theta":np.concatenate([[np.diff(pos)[0]], np.diff(pos)]),
                  "thetadot":tan_thetadot, "Phi":tan_Phi, "Phidot":tan_Phidot, "alphadot":alphadot,
@@ -804,3 +847,40 @@ def compute_aic(residuals, num_params):
     quad_form = np.sum(resid_array @ inv(Sigma) * resid_array)
     log_likelihood = -0.5 * T * logdet - 0.5 * quad_form
     return 2 * num_params - 2 * log_likelihood
+
+
+# This didn't quite behave. Ignore for now.
+# @njit(cache=True)
+# def linear_regression(x, y):
+#     """
+#     Perform linear regression using Numba for speed.
+#     """
+#     x_mean = np.mean(x)
+#     y_mean = np.mean(y)
+#     m = np.sum((x - x_mean) * (y - y_mean)) / np.sum((x - x_mean) ** 2)
+#     b = y_mean - m * x_mean
+#     return m, b
+
+# import numpy.linalg as LA
+# @njit(cache=True)
+# def linear_regression_LA(x, y):
+#     return LA.pinv(x) @ y
+
+# @njit(cache=True)
+# def bootstrap_CI_jit(x, y, n_boot=1000, alpha=0.05):
+#     """
+#     Perform bootstrap regression to calculate confidence intervals.
+#     """
+#     n = len(x)
+#     m_values = np.zeros((n_boot, x.shape[1]))
+
+#     for i in range(n_boot):
+#         indices = np.random.choice(n, n, replace=True)
+#         x_boot = x[indices]
+#         y_boot = y[indices]
+#         m_values[i] = linear_regression_LA(x_boot, y_boot).T
+#     return m_values
+
+# def bootstrap_CI(x, y, n_boot=1000, alpha=0.05):
+#     m_values = bootstrap_CI_jit(x, y, n_boot=n_boot, alpha=alpha)
+#     return np.percentile(m_values, [2.5,97.5], axis=0).T

@@ -484,7 +484,8 @@ def plot_behavior_bout(generator_vars, cmap_name="nipy_spectral"):
 def plot_traintracks(
     pos, target_positions, ax, crossties=0,
     pos_label="pursuer", target_label="target",
-    xtie_kwargs={}, pos_kwargs={}, target_kwargs={}):
+    xtie_kwargs={}, pos_kwargs={"color":"b"}, target_kwargs={"color":"orange"},CI_kwargs={},
+    D=None, pos_CI=None):
     """
     Parameters
     ----------
@@ -494,6 +495,7 @@ def plot_traintracks(
     crossties: (int) If > 0, plot dashed lines (crossties) between the pursuer and target at every crossties-th time step.
         Set to 0 to disable crossties.
     pos_label: (str) Label for the pursuer's trajectory in the legend.
+    D: int, optional If int is not None, will plot the points at which the pursuer is within D pixels of the target.
     
     """
     assert np.iscomplexobj(pos)
@@ -506,6 +508,13 @@ def plot_traintracks(
     # Plot ground truth for pursuer
     ax.plot(pos.real, pos.imag,  **pos_kwargs)
     ax.plot(pos.real[0], pos.imag[0], marker="o",label=pos_label, **pos_kwargs)
+    
+    
+    if D is not None:
+        D_arr = np.abs(target_positions - pos)
+        proximal_inds = np.where(D_arr < D)[0]
+        ax.plot(pos.real[proximal_inds], pos.imag[proximal_inds], "o", color="magenta", alpha=0.4,)
+
 
     if crossties:
         for xtie_ind in np.arange(0, len(pos), crossties):
@@ -513,7 +522,13 @@ def plot_traintracks(
                 [pos.real[xtie_ind], target_positions.real[xtie_ind]],
                 [pos.imag[xtie_ind], target_positions.imag[xtie_ind]],
                 c="k", alpha=0.3, linestyle="dashed", **xtie_kwargs)
-            
+    
+    if pos_CI is not None:
+        ax.fill_between(
+            pos_CI[0].real, pos_CI[0].imag,
+            pos_CI[1].real, pos_CI[1].imag,
+            **CI_kwargs)
+        
 
 """Neuropixel"""
 from matplotlib import cm
@@ -689,62 +704,81 @@ def plot_k_N(res, Phi, axes, labelk, labelN):
         [ax.legend(handletextpad=0.1) for ax in axes]
 
 
-def plot_contrib_trace(t_df, res, contrib_axes, model_name, model_sobriquet):
+def plot_contrib_trace(t_df, x, contrib_axes, model_name, fps):
     """Contributions of D and r components
     Parameters
     ----------
     t_df : pd.DataFrame
         dataframe with thetadot, Phidot, Phidot, alphadot
-    res : scipy.optimize._optimize.OptimizeResult
-        result of the optimization
+    x : (np.array) parameters
     contrib_axes : list
         list of axes to plot D, r, and prediction
     model_name : str
         model name, e.g. r"$D(\Phi) + r(\Phi)\dot{\Phi}$",
-    model_sobriquet : str
-        model sobriquet  e.g.  "D + r Phidot"
+        function to compute the prediction from the parameters
+    fps : int
+        frames per second of the video
     """
-    thetadot = t_df.thetadot.values
-    t_Phi, t_Phidot, t_alphadot = t_df.Phi.values, t_df.Phidot.values, t_df.alphadot.values
-    model_fun_d = {
-            "D + r Phidot": lambda x, t_Phi=t_Phi, t_Phidot=t_Phidot: get_thetadot_PR(t_Phi, t_Phidot, *x),
-            "D + r alphadot": (lambda x, t_Phi=t_Phi, t_alphadot=t_alphadot: get_thetadot_PR(t_Phi, t_alphadot, *x)),
-            "D": lambda x, t_Phi=t_Phi: D(*x, t_Phi),
-            "r Phidot": lambda x, t_Phi=t_Phi, t_Phidot=t_Phidot: r(*x, t_Phi) * t_Phidot,
-            "r alphadot":lambda x, t_Phi=t_Phi, t_alphadot=t_alphadot: r(*x, t_Phi) * t_alphadot,
-            "linear Phidot": lambda x, t_Phi=t_Phi, t_Phidot=t_Phidot:     x[0] * t_Phi + x[1] * t_Phidot,
-            "linear alphadot": lambda x, t_Phi=t_Phi, t_alphadot=t_alphadot: x[0] * t_Phi + x[1] * t_alphadot}
+    t_Phi, t_alphadot, thetadot = t_df.Phi.values,t_df.alphadot.values,  t_df.thetadot.values
     
-    model_fun = model_fun_d[model_sobriquet]
-    is_Phidot = r"\dot{\Phi}" in model_name
+    model_fun = {
+        "proportional pursuit": (
+            lambda x, t_Phi=t_Phi: x[0] * t_Phi),
+        "biased proportional pursuit": (
+            lambda x, t_Phi=t_Phi: x[0] * t_Phi + np.sign(t_Phi) * x[1]),
+        "parallel navigation":(
+            lambda x, t_Phi=t_Phi, t_alphadot=t_alphadot: x[0] * t_alphadot),
+        "mixed":(
+            lambda x, t_Phi=t_Phi, t_alphadot=t_alphadot: x[0] * t_Phi + x[1] * t_alphadot),
+    }[model_name]
 
-    dot_var = t_Phidot if is_Phidot else t_alphadot
+    x_t = np.arange(len(t_df)) / fps
+    tau, tau1 = t_df.tau.values[0], t_df.tau1.values[0]
 
-    x_t = np.arange(len(t_df)) / 30.01
-
-    contrib_axes[0].plot(x_t, t_Phi, color="blue")
-    contrib_axes[1].plot(x_t, dot_var, color="c")
-    
+    # Plot ground truth first
     contrib_axes[2].plot(x_t, thetadot, label=r"$\dot{\theta}$ ground truth", color="grey")
-    prediction = model_fun(res.x)
+    contrib_axes[2].set(ylabel=r"$\dot{\theta}$ (deg/s)")
+
+    # Plot prediction
+    prediction = model_fun(x)
     contrib_axes[2].plot(x_t, prediction, label=f"prediction", linewidth=1, color="r")
 
-    VAF = get_VAF(thetadot, prediction)
-    error = MAE(thetadot, prediction)
-    plt.suptitle(f"VAF: {VAF:.2f}, MAE: {error:.2f}")
-    # Plot D component only if D is not already the whole function, because otherwise the number of parameters would not match correctly
-    if "D" in model_sobriquet and "r" in model_sobriquet:
-        contrib_axes[2].plot(
-            x_t, D(*res.x[:2], t_Phi), label=r"$r\dot{\Phi}$" if is_Phidot else r"$r\dot{\alpha}$",
-            linewidth=1, color="b")
+
+    # Now plot contributions
+    if "mixed" in model_name:
+        contrib_axes[0].plot(x_t, t_Phi, color="blue")
+        contrib_axes[1].plot(x_t, t_alphadot, color="c")
+        contrib_axes[2].plot(x_t, x[0] * t_Phi,      label=r"$\Phi$",         linewidth=1, color="b")
+        contrib_axes[2].plot(x_t, x[1] * t_alphadot, label=r"$\dot{\alpha}$", linewidth=1, color="c")
     
-    # Plot r component only if R is not already the whole function. 
-    # That means, you check if D is in the function. more complicated than the previous one.
-    if "r" in model_sobriquet and "D" in model_sobriquet:
-        contrib_axes[2].plot(x_t, r(*res.x[2:], t_Phi) * dot_var, label=f"D", linewidth=1, color="g")
-    
-    tau, tau1 = t_df.tau.values[0], t_df.tau1.values[0]
-    contrib_axes[0].set(ylabel=r"$\Phi$ (deg)", title=f"{model_name} $\\tau$:{tau}, $\\tau1$:{tau1}")
-    contrib_axes[1].set(ylabel=r"$\dot{\Phi}$ (deg/s)" if is_Phidot else r"$\dot{\alpha}$", xlabel="Time (s)")
-    contrib_axes[2].set(ylabel=r"$\dot{\theta}$ (deg/s)")
-    contrib_axes[2].legend()
+    elif "proportional pursuit" in model_name:
+        contrib_axes[0].plot(x_t, t_Phi, color="blue")
+
+    elif "parallel" in model_name:
+        contrib_axes[1].plot(x_t, t_alphadot, color="c")
+
+
+    # plt.suptitle(f"VAF: {get_VAF(thetadot, prediction):.2f}\nMAE: {MAE(thetadot, prediction):.2f}")
+    contrib_axes[0].set(ylabel=r"$\Phi$ (deg)")
+    contrib_axes[1].set(ylabel=r"$\dot{\alpha}$", )
+    contrib_axes[2].set(xlabel="Time (s)")
+
+    contrib_axes[2].legend(loc="right", bbox_to_anchor=(1.2, 0.5), fontsize=8)
+
+
+
+import matplotlib as mpl
+import cycler
+
+from contextlib import contextmanager
+
+@contextmanager
+def set_colormap_cycler(cmap_name='viridis', N=10):
+    cmap = plt.get_cmap(cmap_name, N)
+    colors = [cmap(i) for i in range(N)]
+    orig_cycler = mpl.rcParams['axes.prop_cycle']
+    mpl.rcParams['axes.prop_cycle'] = cycler.cycler(color=colors)
+    try:
+        yield
+    finally:
+        mpl.rcParams['axes.prop_cycle'] = orig_cycler

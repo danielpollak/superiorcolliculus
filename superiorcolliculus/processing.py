@@ -142,7 +142,7 @@ def dangle_dt(angles):
 
 
 # Generate histogram of speeds
-def get_speed_timeseries(arr_x, arr_y, interval=5, fps=30):
+def get_speed_timeseries(arr_x, arr_y, fps,):
     """gets a timeseries of average speed with intervals of `interval`
     Parameters
     ----------
@@ -161,8 +161,15 @@ def get_speed_timeseries(arr_x, arr_y, interval=5, fps=30):
 
 def read_DLC_csv(path):
     """Reads DLC csv and returns a pandas dataframe"""
+    # Get length of header
+    sniffer_df = pd.read_csv(path, header=None)
+
+    # Number of elements in the first 9 elements of the first column
+    # This is to determine how many header rows there are before it starts doing '0', '1', '2', etc.
+    header_len = sum([len(elem) > 1 for elem in sniffer_df.iloc[:9,0]])
+
     # Read csv to dataframe
-    df = pd.read_csv(path, header=[0, 1, 2, 3], encoding="latin-1")
+    df = pd.read_csv(path, header=list(range(header_len)), encoding="latin-1")
 
     # Columns have only relevant info
     new_cols = [None] * len(df.columns)
@@ -354,27 +361,27 @@ def get_bodypart(df, bodypart):
     """
     Parameters
     ----------
-    df: (pandas.DataFrame) DLC dataframe
+    df: (pandas.DataFrame) DLC dataframe, parsed with read_DLC_csv
     bodypart: (str) Bodypart to get
     
     Returns
     -------
     np.array (complex numbers)
     """
-    if ("mouse", bodypart, "x") in df.columns:
-        arr = df[[("mouse", bodypart, "x"), ("mouse", bodypart, "y")]].values
-    elif ("single", bodypart, "x") in df.columns:
-        arr = df[[("single", bodypart, "x"), ("single", bodypart, "y")]].values
-    else:
-        raise Exception(f"Bodypart {bodypart} not found in dataframe")
-    
+    '''Sometimes dlc dfs have three or two elements in their column names.
+    Here I will simply check the second to last element'''
+    # First, make all columns equal to the original values last two elements.
+    df.columns = [tuple(col[-2:]) for col in df.columns]
+    arr = df[[(bodypart, "x"), (bodypart, "y")]].values
     return arr[:,0] + 1j * arr[:,1]
 
 
 def clean_target_positions(df):
-    mag_x, mag_y = df[('single', 'mag', 'x')].values, df[('single', 'mag', 'y')].values
-    roach_x, roach_y = df[('single', 'roach', 'x')].values, df[('single', 'roach', 'y')].values
-    roach_L, mag_L = df[('single', 'roach', 'likelihood')].values, df[('single', 'mag', 'likelihood')].values
+    df.columns = [tuple(col[-2:]) for col in df.columns]
+
+    mag_x, mag_y = df[('mag', 'x')].values, df[('mag', 'y')].values
+    roach_x, roach_y = df[('roach', 'x')].values, df[('roach', 'y')].values
+    roach_L, mag_L = df[('roach', 'likelihood')].values, df[('mag', 'likelihood')].values
 
     # target_x, target_y = roach_x.copy(), roach_y.copy()
     target_x, target_y = mag_x.copy(), mag_y.copy()
@@ -400,7 +407,7 @@ def clean_target_positions(df):
     return target_x, target_y
 
 
-def get_relevant_measures(dlc_csv, conversion_rate, use_cv2_target_keypoints=False):
+def get_relevant_measures(dlc_csv, conversion_rate):
     """
     Parameters:
     -----------
@@ -428,9 +435,7 @@ def get_relevant_measures(dlc_csv, conversion_rate, use_cv2_target_keypoints=Fal
 
     df = read_DLC_csv(dlc_csv)
     # Get mouse and target positions
-    headstage_base = interpolate_cubic_spline(get_bodypart(df, "headstage_base"))
-    headstage_base_x, headstage_base_y = headstage_base.real, headstage_base.imag
-
+    
     neck = interpolate_cubic_spline(get_bodypart(df, "spine1"))
     neck_x, neck_y = neck.real, neck.imag
 
@@ -442,31 +447,20 @@ def get_relevant_measures(dlc_csv, conversion_rate, use_cv2_target_keypoints=Fal
 
     # Get target positions
     # Remove target outliers by using the mag, and then for when the likelihood of the roach is greater than the mag, use the roach.
-    target_x = df[('single', 'mag', 'x')].values
-    target_y = df[('single', 'mag', 'y')].values
+    if ("mag", "x") in df.columns.tolist():
+        target = get_bodypart(df, "mag")
+        # If the likelihood of the roach is greater than the mag, use the roach
+        swap_in_roach_inds = np.where(df[('single', 'roach', 'likelihood')] > df[('single', 'mag', 'likelihood')])[0]
+        target_x[swap_in_roach_inds] = df[('single', 'roach', 'x')][swap_in_roach_inds]
+        target_y[swap_in_roach_inds] = df[('single', 'roach', 'y')][swap_in_roach_inds]
 
-    if use_cv2_target_keypoints:
-                
-        # Read in pursuit target data
-        cv2_target_df = pd.read_csv(cv2_csv).reset_index()
-        # windowed pursuit target data
-        win_cv2_target_df = cv2_target_df.iloc[win[0]:win[1]]
-        # Fill in the gaps if possible with DLC data
-        # Get indices of nan values
-        naninds = win_cv2_target_df.isna().any(axis=1)
-        cv2_target_x, cv2_target_y = cv2_target_df["x"].values, cv2_target_df["y"].values
-
-        # For the nan values, fill in with DLC data
-        cv2_target_x[naninds] = target_x[naninds]
-        cv2_target_y[naninds] = target_y[naninds]
-
-        target_x = cv2_target_x # scipy.signal.medfilt(interpolate_cubic_spline(cv2_target_x), 5)
-        target_y = cv2_target_y # scipy.signal.medfilt(interpolate_cubic_spline(cv2_target_y), 5)
+    elif ("puck", "x") in df.columns.tolist():
+        target = get_bodypart(df, "puck")
     
-    # If the likelihood of the roach is greater than the mag, use the roach
-    swap_in_roach_inds = np.where(df[('single', 'roach', 'likelihood')] > df[('single', 'mag', 'likelihood')])[0]
-    target_x[swap_in_roach_inds] = df[('single', 'roach', 'x')][swap_in_roach_inds]
-    target_y[swap_in_roach_inds] = df[('single', 'roach', 'y')][swap_in_roach_inds]
+    else:
+        raise ValueError("No target found in DLC data. Please check the DLC csv file.")
+    
+    target_x, target_y = target.real, target.imag
 
     # If the distance between two points is greater than 100, it's an outlier
     aberrant_inds = np.where(np.sqrt(np.diff(target_x) ** 2 + np.diff(target_y)) > 100)[0]
@@ -774,8 +768,17 @@ def plot_units_on_probe(unit_df, NP1, waveform_d, normalize=True, ax=None, color
         ax.plot(x + xcoords, waveforms.T + ycoords, linewidth=1, color=color)
     return ax
 
-
-
-
+def parse_param_string(param_string):
+    """
+    Parses a parameter string from a Kilosort2 config file.
+    Parameters
+    ----------
+    param_string : str
+        The parameter string to parse, should be in form "[p1, p2]".
+    Returns
+    -------
+    np.array
+    """ 
+    return np.fromstring(param_string.strip("[]"), sep=" ")
 
 
