@@ -662,8 +662,8 @@ def plot_D_r(res, Phi, axes, labelD, labelr):
     axes[0].plot(X, D(D_sigma, D_A, X),  color="grey", zorder=-np.inf)
     axes[1].plot(X, r(r_sigma, r_A, X),  color="grey", zorder=-np.inf)
     
-    axes[0].set(xlabel="$\Phi$ (deg)", ylabel="$D(\Phi)$")
-    axes[1].set(xlabel="$\Phi$ (deg)", ylabel="$r(\Phi)$")
+    axes[0].set(xlabel=r"$\Phi$ (deg)", ylabel=r"$D(\Phi)$")
+    axes[1].set(xlabel=r"$\Phi$ (deg)", ylabel=r"$r(\Phi)$")
     
     for ax in axes.flatten():
         if np.sum(np.abs(ax.get_ylim())) < 1e-5:
