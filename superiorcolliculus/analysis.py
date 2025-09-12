@@ -9,7 +9,7 @@ from scipy.optimize import minimize
 import re
 from collections import deque
 from datetime import datetime
-from numba import njit, int32, float64
+from numba import jit, njit, int32, float64
 from numba.experimental import jitclass
 import numpy as np
 from numpy.linalg import slogdet, inv
@@ -210,7 +210,7 @@ def biased_prop_pursuit_dtheta_dt(Phi_queue, alpha_queue, params):
 # ---- Guidance Law ----
 from numba import njit
 @njit(cache=True)
-def sigmoid(x, x0, k=1):
+def sigm(x, x0, k=1):
     """Sigmoid function"""
     L = 1 # Maximum value
 
@@ -280,7 +280,7 @@ def guidance_law(parameters, experimental_data, tau, tau1, mode):
             dtheta_dt = par_nav_dtheta_dt_Phi(Phi_queue, alpha_queue, parameters)
         elif mode == 7:
             distance = np.abs(target_position - coords[i]) # distance to target
-            sig = sigmoid(distance, parameters[-1]) 
+            sig = sigm(distance, parameters[-1]) 
 
             # When Distance is low, we use PN pursuit, when high, we use PP
             PP_contrib = sig * prop_pursuit_dtheta_dt(Phi_queue, alpha_queue, np.array([parameters[0]]))
@@ -289,7 +289,7 @@ def guidance_law(parameters, experimental_data, tau, tau1, mode):
 
         elif mode == 8:
             distance = np.abs(target_position - coords[i]) # distance to target
-            sig = sigmoid(distance, parameters[-1]) 
+            sig = sigm(distance, parameters[-1]) 
 
             # When Distance is low, we use PP, when high, we use PN
             PP_contrib = (1-sig) * prop_pursuit_dtheta_dt(Phi_queue, alpha_queue, np.array([parameters[0]]))
@@ -482,7 +482,7 @@ LOGFILE = None
 
 def init_log(label, tau, tau1,mode):
     global LOGFILE
-    LOGFILE = r"C:\Users\dan\Documents\SuperiorColliculus\data\log" + f'\SC{label}_mode{mode}_tau{tau}_tau1{tau1}_log.csv'
+    LOGFILE = r"C:\Users\dan\Documents\SuperiorColliculus\data\log" + f'\\SC{label}_mode{mode}_tau{tau}_tau1{tau1}_log.csv'
 
     with open(LOGFILE, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -526,13 +526,13 @@ def incremental_guidance_law(experimental_data, guidance_law_params):
         
         parameter_df["handicap"] = start
         parameter_df_l.append(parameter_df)
-    
 
     return pd.concat(parameter_df_l)
 
 
 def get_guidance_law_df(experimental_data_l:list, mode,  initial_guess:tuple, tau:int, tau1:int, subject):
     """Selects guidance law and appropriate constraints to optimize
+
     Parameters
     ----------
     experimental_data: (list of tuples) list of: initial_heading, init_position, step_sizes, target_positions, pos
@@ -618,27 +618,43 @@ def get_directional_variables(pos, target_positions, fps, body_angle_vectors=Non
     return thetadot, phi, alphadot, phidot
 
 
-def get_lagged_design_matrix(predictor, d):
+def get_lagged_design_matrix(predictor, d_past, d_future=0):
     """
     Create time-lag design matrix from stimulus intensity vector.
+    AKA an FIR
     Args:
-        stim (1D array): Stimulus intensity at each time point.
+        stim (np.ndarray): M datapoints x 1 dimensional array
+            Stimulus intensity at each time point.
         d (number): Number of time lags to use.
     Returns
         X (2D array): GLM design matrix with shape T, d
     """
-    # Create version of stimulus vector with zeros before onset
-    padded_stim = np.concatenate([np.zeros(d - 1), predictor.T])
+    assert (d_past > 0) or (d_future > 0)
 
+    past_padded_stim, future_padded_stim = predictor, predictor
+
+
+    # You subtract one to make sure that the first line has only one non-padded element.
+    past_padded_stim = np.concatenate([np.zeros(max(0,d_past - 1)), predictor.T])
+
+    # Same playbook as above, but with future. So flip it around
+    future_padded_stim = np.concatenate([predictor.T, np.zeros(d_future)])
+    
+    
     # Construct a matrix where each row has the d frames of
     # the stimulus preceding and including timepoint t
     T = len(predictor)  # Total number of timepoints
-    X = np.zeros((T, d))
-    for t in range(T):
-        X[t] = padded_stim[t:t + d]
-    # X = np.hstack((np.ones((X.shape[0],1)), X))
-    return X
+    X = np.zeros((T, d_past + d_future))
 
+    for t in range(T):
+
+        sl_past = past_padded_stim[t:t+d_past]
+        # Flip back around so it is in the right order
+        sl_future = future_padded_stim[t+1:t+d_future+1]
+
+        X[t,:] = np.concatenate([sl_past, sl_future])
+    
+    return X
 
 
 def crosscorr(x,y):
@@ -849,38 +865,363 @@ def compute_aic(residuals, num_params):
     return 2 * num_params - 2 * log_likelihood
 
 
-# This didn't quite behave. Ignore for now.
-# @njit(cache=True)
-# def linear_regression(x, y):
-#     """
-#     Perform linear regression using Numba for speed.
-#     """
-#     x_mean = np.mean(x)
-#     y_mean = np.mean(y)
-#     m = np.sum((x - x_mean) * (y - y_mean)) / np.sum((x - x_mean) ** 2)
-#     b = y_mean - m * x_mean
-#     return m, b
 
-# import numpy.linalg as LA
-# @njit(cache=True)
-# def linear_regression_LA(x, y):
-#     return LA.pinv(x) @ y
+def sigmoid(x, A, m, b):
+    """
+    A: amplitude (limit)
+    m: slope
+    b: x offset"""
+    return A / (1 + np.exp(-m*(x-b)))
 
-# @njit(cache=True)
-# def bootstrap_CI_jit(x, y, n_boot=1000, alpha=0.05):
-#     """
-#     Perform bootstrap regression to calculate confidence intervals.
-#     """
-#     n = len(x)
-#     m_values = np.zeros((n_boot, x.shape[1]))
 
-#     for i in range(n_boot):
-#         indices = np.random.choice(n, n, replace=True)
-#         x_boot = x[indices]
-#         y_boot = y[indices]
-#         m_values[i] = linear_regression_LA(x_boot, y_boot).T
-#     return m_values
+def get_spiketrain_histogram(st, iup1, bins):
+    """
+    Limits histogram to be within the bounds of the video, hence range
+    Step is the inter frame interval or bins
 
-# def bootstrap_CI(x, y, n_boot=1000, alpha=0.05):
-#     m_values = bootstrap_CI_jit(x, y, n_boot=n_boot, alpha=alpha)
-#     return np.percentile(m_values, [2.5,97.5], axis=0).T
+    
+    """
+    counts, time = np.histogram(st, range=(iup1[0], iup1[-1]), bins=bins)
+    return counts, time
+
+
+def clean_features(arr):
+    """
+    Clean feature array: Turn nans into last real value
+    """
+    curr = 0
+    for i in range(len(arr)):
+        if np.isnan(arr[i]):
+            arr[i] = curr
+        else:
+            curr = arr[i]
+    return arr
+
+
+
+@njit(cache=True)
+def get_theta_mse(X, spike_counts):
+    """Parameters
+    ----------
+    X : array
+        Design matrix
+    spike_counts : array
+        Spike counts    """
+    return np.linalg.inv(X.T @ X) @ X.T @ spike_counts
+
+
+@njit(cache=True)
+def neg_log_lik_LNP(theta, X, y, beta):
+    """From https://github.com/NeuromatchAcademy/course-content/blob/main/tutorials/W1D3_GeneralizedLinearModels/solutions/W1D3_Tutorial1_Solution_90f0230d.py"""
+    """Return -loglike for the Poisson GLM model.
+    Args:
+        theta (1D array): Parameter vector.
+        X (2D array): Full design matrix.
+        y (1D array): Data values.
+    Returns:
+        number: Negative log likelihood.
+    """
+    # Compute the Poisson log likelihood
+    rate = np.exp(X @ theta)
+    
+    log_lik = y @ np.log(rate) - rate.sum() - beta*np.sum( theta**2)
+    # could just use mean squared error
+    return -log_lik
+
+
+def fit_LNP(spikes, X, x0, beta=0):
+    """https://github.com/NeuromatchAcademy/course-content/blob/main/tutorials/W1D3_GeneralizedLinearModels/solutions/W1D3_Tutorial1_Solution_90f0230d.py"""
+    """Obtain MLE parameters for the Poisson GLM.
+    Args:
+        stim (1D array): Stimulus values at each timepoint
+        spikes (1D array): Spike counts measured at each timepoint
+        d (number): Number of time lags to use.
+    Returns:
+        1D array: MLE parameters
+    """
+    #
+    y = spikes
+
+    # Find parameters that minmize the negative log likelihood function
+    res = minimize(neg_log_lik_LNP, x0, args=(X, y, beta))
+
+    return res["x"], res
+
+
+def mean_sq_err(Ambtheta, X, y, beta=0):
+    """ """
+    A = Ambtheta[0]
+    m = Ambtheta[1]
+    b = Ambtheta[2]
+    theta = Ambtheta[3:]
+    return np.mean((y-sigmoid(X @ theta, A, m, b))**2) + beta*np.sum(theta**2)
+
+
+def fit_LNS(spikes, X, x0, beta=0, maxiter=1000):
+    """https://github.com/NeuromatchAcademy/course-content/blob/main/tutorials/W1D3_GeneralizedLinearModels/solutions/W1D3_Tutorial1_Solution_90f0230d.py"""
+    """Obtain MLE parameters for the Sigmoid GLM.
+    Args:
+        spikes (1D array): Spike counts measured at each timepoint
+        X (2D array): Full design matrix.
+        x0 (1D array): Initial guess for MLE parameters.
+        beta (float): Regularization parameter.
+        maxiter (int): Maximum number of iterations for optimization.
+    Returns:
+        1D array: MLE parameters
+    """
+    y = spikes
+
+    # Find parameters that minimize the mean square error function
+    # x0 = (A, m, b, theta)
+    constraints = [
+        {"type":"ineq", "fun": lambda initial_guess: initial_guess[0]}, # A is > 0
+        {"type":"ineq", "fun": lambda initial_guess: initial_guess[1]}, # m is > 0
+        # New addition
+        # theta is within the range of the initial guess
+        # {"type":"ineq", "fun": lambda initial_guess: np.max(np.abs(initial_guess[-1])) <= np.max(np.abs(x0[-1]))}
+    ]
+    
+    res = minimize(mean_sq_err, x0, args=(X, y, beta), constraints=constraints, method="trust-constr", options={"maxiter":maxiter})
+    A, m, b = res["x"][0], res["x"][1], res["x"][2]
+    theta = res["x"][3:]
+    
+    return A, m, b, theta, res
+
+
+def GLM_driver(counts, predictor, d=32, beta=0, LNP=False, maxiter=1000):
+    """
+    Parameters
+    ----------
+    counts : (array) Binned spike counts
+    predictor : (array) Stimulus intensity
+    d: (int, optional) Number of time lags to use. The default is 32.
+    beta : (float, optional) Regularization parameter. The default is 0.
+    
+    Returns
+    -------
+    theta_MSE : (array) Raw STA linear filter (initial guess)
+    theta : (array) linear filter after optimizing alongside nonlinearity
+    A : (float) Amplitude
+    m : (float) Slope
+    b : (float) Offset
+    """
+    
+    X = get_lagged_design_matrix(predictor, d=d)
+    # STA
+    theta_MSE = get_theta_mse(X, counts)
+
+    # Fit
+    if LNP:
+        theta = fit_LNP(counts, X, theta_MSE, beta=beta)
+        A, m, b = None, None, None
+    else:
+        A_init = np.max(counts)
+        A, m, b, theta, res = fit_LNS(counts, X, np.concatenate((np.array([A_init, 5, 1]), theta_MSE)), beta=beta, maxiter=maxiter)
+    
+    return theta_MSE, theta, A, m, b, res
+
+
+def plot_GLM(theta_MSE, theta, A, m, b, counts, time, predictor, d, LNP=False, expt="", label="", save=True):
+    """generate diagnostic plots
+    Parameters
+    ----------
+    theta_MSE : (array) Raw STA linear filter (initial guess)
+    theta : (array) linear filter after optimizing alongside nonlinearity
+    A : (float) Amplitude
+    m : (float) Slope
+    b : (float) Offset
+
+    counts : (array) Binned spike counts
+    time : (array) Time bins
+    predictor : (array) Stimulus intensity
+    d : (int, optional) Number of time lags to use. The default is 32.
+    beta : (float, optional) Regularization parameter. The default is 0."""
+
+    """Visualize kernels"""
+    fig, ax = plt.subplots(1,2, figsize=(9,3))
+    ax[0].plot(theta_MSE, label="STA") 
+    ax[0].plot(theta, label="linear filter estimate")
+    ax[0].set_title("linear filters")
+    ax[0].legend()
+    
+    if not LNP:
+        x = np.arange(-5,15,0.1)
+        ax[1].plot(x, sigmoid(x, A, m, b), label=f"A: {np.round(A,3)}, m: {np.round(m,3)}, b:{np.round(b,3)}")
+        ax[1].legend()
+    else: 
+        raise NotImplementedError 
+    
+    if save:
+        fig.savefig(r"C:\Users\dan\Documents\SuperiorColliculus\figs\LN" + f"\\{expt}_kernels_{label}.png")
+        plt.close(fig)
+
+    """Visualize fits"""
+    fig, ax = plt.subplots(2,1,figsize=(10,6))
+    ax[0].plot(time, predictor)
+    ax[1].plot(time, counts, label="spike counts", color="k")
+    X = get_lagged_design_matrix(predictor, d)
+    ax[1].plot(time, X @ theta_MSE, label="activation", color="b")
+    if LNP:
+        ax[1].plot(time, np.exp(X @ theta), label="LNP", color="c")
+    else:
+        ax[1].plot(time, sigmoid(X @ theta, A, m, b), label="LNS", color="c")
+    
+    ax[0].set_ylabel("predictor")
+    ax[1].set_ylabel("spike counts")
+    ax[1].set_xlabel("time (s)")
+    ax[1].legend()
+    if save:
+        fig.savefig(r"C:\Users\dan\Documents\SuperiorColliculus\figs\LN" + f"\\{expt}_predictions_{label}.png")
+        plt.close(fig)
+
+
+def get_sta_X(X, r):
+    """Gets spike triggered average using the design matrix
+    Parameters
+    ----------
+    X : (np.ndarray) Design matrix, should be 2D
+    r : (np.ndarray) Spike counts, should be 1D
+    
+    Returns
+    -------
+    sta : (np.ndarray) Spike triggered average, same length as number of columns in X
+
+    """
+    assert r.ndim==1
+    assert X.ndim==2, "X should be 2D, got {}".format(X.ndim)
+    assert X.shape[0] == r.shape[0], "X and r should have the same number of rows, got {} and {}".format(X.shape[0], r.shape[0])
+    assert X.shape[1] > 0, "X should have at least one column, got {}".format(X.shape[1])
+    
+    n_spikes = np.sum(r)
+    sta = X.T @ r / n_spikes  # Scales to the actual units of what we are looking at # * X.shape[1]
+
+    return sta
+
+
+
+from concurrent.futures import ThreadPoolExecutor
+def bootstrap_sta_X_l(X, r, mask=None, N_SHUFFLES=1000, max_workers=None, shuffle_X=False):
+    assert type(N_SHUFFLES) is int, "N_SHUFFLES should be an integer, got {}".format(type(N_SHUFFLES))
+    
+    if mask is None:
+        mask = np.ones(len(r), dtype=bool)
+    
+    r_masked = r[mask]
+    X_masked = X[mask]
+    
+    r_shuffles = np.random.uniform(0, len(r_masked), N_SHUFFLES)
+
+    def _single_shuffle(s):
+        r_rolled = np.roll(r_masked, int(s))
+
+        return get_sta_X(X_masked, r_rolled)
+
+    def _single_shuffle_X(s):        
+        r_rolled = np.roll(r_masked, int(s))
+
+        X_shift = int(np.random.uniform(0, X.shape[1]))
+        X_rolled = np.roll(X_masked, X_shift)
+
+        return get_sta_X(X_rolled, r_rolled)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        return list(executor.map(_single_shuffle_X if shuffle_X else _single_shuffle, r_shuffles))
+
+
+def conv_circ( signal, ker ):
+    '''
+        signal: real 1D array
+        ker: real 1D array
+        signal and ker must have same shape
+    '''
+    assert len(signal) == len(ker), "signal and ker must have same shape"
+    # Circular convolution using FFT
+    return np.real(np.fft.ifft( np.fft.fft(signal)*np.fft.fft(ker) ))
+
+
+def get_sta(predictor, r, window=None):
+    '''
+    Computes the spike-triggered average (STA) of a predictor and a response 
+    via circular convolution.
+    Parameters
+    ----------
+    predictor: real 1D array
+    r: real 1D array
+    window: int, half-size of STA to return
+
+    Returns
+    -------
+    rolled_sta: real 1D array
+    '''
+    assert predictor.ndim == 1, "predictor must be 1D"
+    assert r.ndim == 1, "r must be 1D"
+    # assert len(predictor) == len(r), "predictor and r must have same shape"
+    
+    scaled_sta = conv_circ(predictor, r [::-1]) / np.sum(r)
+    mp = len(scaled_sta) // 2
+
+    # Roll the STA to center it
+    rolled_sta = np.roll(scaled_sta, mp)
+
+    # 
+    if window is not None:
+        # For some reason the STA is shifted by half the window size
+        rolled_sta = rolled_sta[mp - window:mp + window]
+    return rolled_sta
+
+
+def circconv_sta_test(sta, comparisons=1000, test_statistic=np.var):
+    """Generates null distribution of test_statistic and 
+    of the middle of the STA. 
+
+    Parameters
+    ----------
+    sta: (np.array) Spike-triggered average, full circular convolution. No windowing.
+    comparisons: (int) Number of comparisons to make
+    test_statistic: (function) Function to compute the test statistic, e.g. np.var, np.mean, etc.
+
+    Returns
+    -------
+    statistic_vals: (np.array) Null distribution of test_statistic
+    mp_sta: (float) Test statistic of the middle of the STA
+    """
+    # first, split up sta into comparisions sections centered around the middle
+    winlen = len(sta) // comparisons
+    mp = len(sta) // 2
+
+    # First, get STA middle
+    mp_sta = test_statistic(sta[mp - winlen // 2:mp + winlen // 2])
+
+    # Then, get the middleless STA
+    middleless_sta = np.concatenate(
+        [sta[:mp - winlen // 2],
+         sta[mp + winlen // 2:]]
+    )
+
+    # Compute statistics for each section
+    statistic_vals = [
+        test_statistic(
+            middleless_sta[i * winlen:(i + 1) * winlen]
+        ) for i in range(comparisons - 1)]
+    
+
+    return np.array(statistic_vals), mp_sta
+
+
+def get_pval(arr, val):
+    '''
+        arr: 1D array
+        val: value to compare against
+    '''
+    return np.sum(arr >= val) / len(arr)
+
+
+def sorted_eig(mat):
+    eig = np.linalg.eig(mat)
+    eigenvalues = eig.eigenvalues
+    eigenvectors = eig.eigenvectors
+
+    sort_inds = np.argsort(eigenvalues)[::-1]
+    eigenvalues = eigenvalues[sort_inds]
+    eigenvectors = eigenvectors[:, sort_inds]
+    return eigenvalues, eigenvectors
