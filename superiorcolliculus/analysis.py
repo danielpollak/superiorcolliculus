@@ -746,9 +746,8 @@ def get_contingency(avi_str):
         return None
 
 
-def get_data_PoggioReichart(subject_l, tau_phi=0, tau_phidot=0):
-    """Data for estimating r and D for each subject 
-    based on ReichaDrt and Poggio (1976) model
+def get_pursuit_data(subject_l, tau_phi=0, tau_phidot=0):
+    """Data guidance law for each subject 
     example inputs;
     cortical: ["SC5",  "SC8", "SC16", "SC44","SC7",]
     acortical: ["SC9", 'SC17',"SC51"]
