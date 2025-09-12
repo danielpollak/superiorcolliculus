@@ -8,6 +8,7 @@ import warnings
 import os
 import scipy.io
 import scipy.ndimage as nd
+
 from numba import njit
 
 from .analysis import *
@@ -34,72 +35,31 @@ def interpolate_cubic_spline(data):
     return data
 
 
-def smooth(angle_arr, box_pts=8):
-    """Maintains original length of array
-    mode = "same" instead of full or valid because full produces an array of the wrong length, valid induces a phase shift, and
-    "same" produces an array that is the wrong length but does not produce a phase shift. I then add back the first value
+def smooth(arr):
+    """Just uses scipy's gaussian filter for non-angle data
+
+    Does different things if arr is complex or not.
+    Parameters
+    ----------
+    arr: np.array 
     """
-    box = np.ones(box_pts)/box_pts
-    y_smooth = np.convolve(angle_arr, box, mode='same')
-    return y_smooth[box_pts//2:-(box_pts//2)]
+    return nd.gaussian_filter1d(arr, 1)
 
 
-# def smooth(data, window_width=8):
-#     """Edited from 
-#     https://stackoverflow.com/questions/14313510/how-to-calculate-rolling-moving-average-using-python-numpy-scipy
-#     in order for the output to be the same length as the input. The naive implementation cuts the first window_width-1
-#     from the output array in terms of length. I add it back in by copying the first value window_width-1 times
-#     """
-#     cumsum_vec = np.nancumsum(np.insert(data, 0, 0)) 
-#     ma_vec = (cumsum_vec[window_width:] - cumsum_vec[:-window_width]) / window_width
-#     ma_vec_evened = np.concatenate((
-#             np.ones((len(data)-len(ma_vec))//2) * ma_vec[0],
-#             ma_vec,
-#             np.ones((len(data)-len(ma_vec))//2 + 1) * ma_vec[-1]
-#         ))
-
-#     return ma_vec_evened[:-1]
 
 
 
 def phasor(angle):
-    """Angle in degrees"""
+    """
+    Parameters
+    ----------
+    angle: Angle in degrees
+    
+    Returns
+    -------
+    np.complex128 """
     return np.exp(1j * np.deg2rad(angle))
 
-# @njit
-# def get_angular_difference(u, v):
-#     """
-#     Parameters
-#     ----------
-#     u, v: np.complex128
-#         Unit phasors representing angles
-#     Returns
-#     -------
-#     np.array (angles, in degrees)
-#         The angular difference between the phasors in degrees
-#     """
-
-#     # Compute the difference using division of complex numbers
-#     eps = 1e-12
-#     u_norm = np.abs(u)
-#     v_norm = np.abs(v)
-#     """old"""
-#     if u_norm < eps or v_norm < eps:
-#         return np.array([0.0])  # or np.nan, or raise a controlled exception
-#     """old"""
-
-#     """new"""
-#     u_norm(np.where(u_norm < eps)) = eps
-#     v_norm(np.where(v_norm < eps)) = eps
-#     """new"""
-
-#     u = u / u_norm
-#     v = v / v_norm
-#     # Calculate the angle of the resulting phasor in degrees
-#     difference_phasor = u / v
-#     angular_difference = (180.0 / np.pi) * np.angle(difference_phasor)
-
-#     return angular_difference # deg
 @njit
 def get_angular_difference_scalar(u, v):
     eps = 1e-12
@@ -113,6 +73,15 @@ def get_angular_difference_scalar(u, v):
 
 @njit
 def get_angular_difference_array(u, v):
+    """Returns the angular difference between two phasors in degrees.
+    Parameters
+    ----------
+    u, v: np.array of phasors
+
+    Returns
+    -------
+    np.array of angular differences in degrees
+    """
     eps = 1e-12
     out = np.empty(len(u))
     for i in range(len(u)):
@@ -138,24 +107,27 @@ def dangle_dt(angles):
     assert np.iscomplexobj(angles), "Angles must be complex, not degrees"
     assert len(angles) > 1, "Angles must have at least 2 elements"
     diffs = get_angular_difference_array(angles[1:], angles[:-1])
+    
     return np.concatenate(([diffs[0]], diffs))
 
 
 # Generate histogram of speeds
-def get_speed_timeseries(arr_x, arr_y, fps,):
+def get_speed_timeseries(arr:np.complex128, fps):
     """gets a timeseries of average speed with intervals of `interval`
     Parameters
     ----------
-    arr_(x/y): (array) x/y positions
-    interval: (int) number of frames to average over
+    arr: (np.complex) xy positions
+    fps: (float or array) frames per second of the video
     """
 
-    inter_frame_interval = 1 / fps * interval
+    # Inter frame interval
+    IFI = 1 / fps # s
 
-    inter_frame_distances = np.array([np.sqrt((arr_x[i] - arr_x[i+interval])**2 + (arr_y[i] - arr_y[i+interval])**2) for i in range(len(arr_x)-interval)])
-
-    speeds = inter_frame_distances / inter_frame_interval # pixels/s
-    speeds = speeds / conversion_rate # cm / s
+    # Inter frame distances
+    IFD = np.abs(np.diff(arr, prepend=arr[0])) / conversion_rate  # cm
+    
+    # Calculate speeds
+    speeds = IFD / IFI # pixels/s
     return speeds
 
 
@@ -179,6 +151,124 @@ def read_DLC_csv(path):
 
     df.columns = new_cols
     return df
+
+
+
+def boris_to_array(b_df, n_frames):
+    """ Convert a Boris DataFrame to an array of behaviors.
+    
+    Parameters
+    ----------
+    b_df : pd.DataFrame
+        DataFrame containing Boris event data with columns "Image index", "Behavior type", and "Behavior".
+    n_frames : int
+        Total number of frames in the video.
+    Returns
+    -------
+    np.ndarray
+        A 1D numpy array where each element corresponds to a behavior at each time point.
+    """
+    # Assert even number of rows
+    assert b_df.shape[0] % 2 == 0, "Boris DataFrame should have an even number of rows, got {}".format(b_df.shape[0])
+    
+    # Assert monotonicity 
+    assert sorted(b_df["Image index"]) == list(b_df["Image index"]), "Image index is not monotonic"
+
+    # Assert there are no zero intervals. That would make things trickier.
+    # assert all(np.diff(b_df["Image index"]) > 0), f"There are zero Image index intervals in the Image index at {np.where(np.diff(b_df['Image index']) <= 0)[0]}"
+    
+    # Init output
+    arr_l = [["other"] * int(b_df.iloc[0]["Image index"])]
+
+    for i in np.arange(0, len(b_df)-2, 2):
+        bh_arr = boris_to_array_helper(b_df, i)
+        
+        # Append the behavior for the duration
+        arr_l.append(bh_arr)
+
+        # Append other for the interval between behaviors
+        arr_l.append(
+            np.array(["other"] * int( 
+                b_df.iloc[i + 2]["Image index"] -  b_df.iloc[i + 1]["Image index"]
+            ), dtype=object)
+        )
+
+    # Now remember, i + 2 at the end is the SECOND TO LAST ROW. Let's add the last interval together, shall we?
+    bh_arr = boris_to_array_helper(b_df, len(b_df) - 2)
+
+    # Append the behavior for the duration
+    arr_l.append(bh_arr)
+
+    curr_len = len(np.concatenate(arr_l))
+    assert curr_len <= n_frames, "Concatenated array length exceeds n_frames: {} > {}".format(len(np.concatenate(arr_l)), n_frames)
+
+    if curr_len < n_frames:
+        # If the last behavior does not fill the array, fill it with "other"
+        arr_l.append(
+            np.array(["other"] * (n_frames - curr_len), dtype=object)
+        )
+    return np.concatenate(arr_l)
+
+
+def boris_to_array_helper(b_df:pd.DataFrame, i:int):
+    """ Helper function to convert a pair of rows in a Boris DataFrame to an array of behaviors."""
+    start_row, stop_row = b_df.iloc[i], b_df.iloc[i+1]
+
+    assert start_row["Behavior type"] == "START"
+    assert stop_row["Behavior type"] == "STOP", "Start and stop rows do not match at index {}".format(i + 2)
+    assert start_row["Behavior"] == stop_row["Behavior"]
+    
+    duration = int(stop_row["Image index"] - start_row["Image index"])
+    bh = start_row["Behavior"]
+
+    return np.array([bh] * duration, dtype=object)
+
+
+def boris_windows_from_arr(boris_arr):
+    """ Get the offsets of behaviors from a boris array.
+    Essentially the opposite of boris_to_array_helper, but it's
+    useful because sometimes you have basically cast away the boris dataframe. 
+
+    Parameters
+    ----------
+    boris_arr: np.array of behaviors, where each behavior is an integer
+    
+    Returns:
+    --------
+    windows: list of tuples (start, stop, behavior)
+    """
+    # Get offsets for behaviors
+    offset_d = {bh:[] for bh in np.unique(boris_arr)}
+    for bh in np.unique(boris_arr):
+        bh_inds = np.where(boris_arr == bh)[0]
+        non_bh_inds = np.where(boris_arr != bh)[0]
+
+        offsets = np.where(np.diff(bh_inds) > 1)
+
+        # Actual indicies where behavior STOPS
+        offset_d[bh].extend(bh_inds[offsets[0]])
+
+    # Concatenate and sort offsets and behaviors
+    offsets = []
+    behaviors = []
+    for bh, offset_l in offset_d.items():
+        offsets.extend(offset_l)
+        behaviors.extend([bh] * len(offset_l))
+    
+    bh_inds = np.argsort(offsets)
+    sorted_offsets = np.array(offsets)[bh_inds]
+    sorted_behaviors = np.array(behaviors)[bh_inds]
+    assert len(sorted_offsets) == len(sorted_behaviors), "Offsets and behaviors lengths do not match"
+
+    # Get windows of behaviors
+    windows = [(0, sorted_offsets[0], sorted_behaviors[0])]
+    for i in range(0,len(sorted_offsets)-1):
+        behavior= sorted_behaviors[i]
+        windows.append((sorted_offsets[i], sorted_offsets[i+1], behavior))
+
+    # assert len(windows) - 1 == len(sorted_offsets), "Windows and offsets lengths do not match"
+    print(len(windows), len(sorted_offsets))
+    return windows 
 
 
 def remove_behaviors(df, behaviors):
@@ -424,8 +514,6 @@ def get_relevant_measures(dlc_csv, conversion_rate):
     target_bearing: np.array, head-target angle, in degs
     head_angle: np.array, allocentric head angle, in degs
     dist: np.array, distance between head and target
-    mouse_speeds: np.array, speed of mouse
-    target_speeds: np.array, speed of target
     (neck_x, neck_y): tuple, x and y positions of neck
     (snout_x, snout_y): tuple, x and y positions of snout
     (base_x, base_y): tuple, x and y positions of base
@@ -434,8 +522,8 @@ def get_relevant_measures(dlc_csv, conversion_rate):
     """
 
     df = read_DLC_csv(dlc_csv)
+
     # Get mouse and target positions
-    
     neck = interpolate_cubic_spline(get_bodypart(df, "spine1"))
     neck_x, neck_y = neck.real, neck.imag
 
@@ -481,10 +569,7 @@ def get_relevant_measures(dlc_csv, conversion_rate):
         # Get distances
         dist = np.sqrt((neck_x - target_x) ** 2 + (neck_y - target_y) ** 2) / conversion_rate
 
-        # Get speeds
-        mouse_speeds = get_speed_timeseries(neck_x, neck_y)
-        target_speeds = get_speed_timeseries(target_x, target_y)
-
+       
         # Get angles
         LOS = (target_x - neck_x) + (target_y - neck_y) * 1j
         head_vector = (snout_x - neck_x) + (snout_y - neck_y) * 1j
@@ -501,7 +586,7 @@ def get_relevant_measures(dlc_csv, conversion_rate):
         
     return {
         'LOS':LOS, 'head_vector':head_vector, 'body_vector':body_vector, 'ego_angle':ego_angle, 'target_bearing':target_bearing,
-        'head_angle':head_angle, 'dist':dist, 'mouse_speeds':mouse_speeds, 'target_speeds':target_speeds, "neck": (neck_x, neck_y),
+        'head_angle':head_angle, 'dist':dist, "neck": (neck_x, neck_y),
         "snout": (snout_x, snout_y), "base": (base_x, base_y), "target":(target_x, target_y), 'df':df
     }
 
@@ -511,17 +596,13 @@ def relevant_measures_to_tuples(rm_d):
     They have to be dictionaries now, but it is useful to be able to unpack them."""
     (
         LOS, head_vector, body_vector, ego_angle, target_bearing, head_angle, dist, 
-        mouse_speeds, target_speeds, (neck_x, neck_y), (snout_x, snout_y), (base_x, base_y), 
-        (target_x, target_y), df
+        (neck_x, neck_y), (snout_x, snout_y), (base_x, base_y), (target_x, target_y), df
     ) = rm_d['LOS'], rm_d['head_vector'], rm_d['body_vector'], rm_d['ego_angle'], \
-            rm_d['target_bearing'], rm_d['head_angle'], rm_d['dist'], rm_d['mouse_speeds'], rm_d['target_speeds'], \
+            rm_d['target_bearing'], rm_d['head_angle'], rm_d['dist'], \
             rm_d['neck'], rm_d['snout'], rm_d['base'], rm_d['target'], rm_d['df']
     
-    return (
-        LOS, head_vector, body_vector, ego_angle, target_bearing, head_angle, dist, 
-        mouse_speeds, target_speeds, (neck_x, neck_y), (snout_x, snout_y), (base_x, base_y), 
-        (target_x, target_y), df
-    )
+    return (LOS, head_vector, body_vector, ego_angle, target_bearing, head_angle, dist, 
+        (neck_x, neck_y), (snout_x, snout_y), (base_x, base_y),  (target_x, target_y), df)
 
 def get_boris_bout(boris_df, bout_ind, behavior="approach"):
     assert behavior in boris_df.Behavior.unique()
@@ -560,8 +641,8 @@ def behavior_bout_generator(avi_boris_dlc, conversion_rate, behavior="approach",
         relevant_measures = get_relevant_measures(dlc_csv, conversion_rate)
 
         (   LOS, head_vector, body_vector, ego_angle, target_bearing, head_angle, dist,
-            mouse_speeds, target_speeds, (neck_x, neck_y), (snout_x, snout_y), (base_x, base_y),
-            (target_x, target_y), df) = relevant_measures_to_tuples(relevant_measures)
+            (neck_x, neck_y), (snout_x, snout_y), (base_x, base_y), (target_x, target_y), df
+        ) = relevant_measures_to_tuples(relevant_measures)
 
         for bout_index in np.arange(0, len(boris_df), 2):
             # Get csv of target positions
@@ -662,7 +743,7 @@ def get_cluster_info(data_path):
 
 
 
-def extract_waveforms(recording, sorting, unit_df, pre=0.001, post=0.002, n_waveforms=100, label="good", sr=30_000):
+def extract_waveforms(recording, sorting, unit_df, pre=0.001, post=0.002, n_waveforms=100, label="good", sr=30_000, bounds=None):
     """
     Extract waveforms from a recording.
 
@@ -675,6 +756,7 @@ def extract_waveforms(recording, sorting, unit_df, pre=0.001, post=0.002, n_wave
     n_waveforms (int, optional): The number of waveforms to extract. Defaults to 100.
     good (bool, optional): Flag to indicate whether to extract waveforms from good units only. Defaults to True.
     sr (int, optional): The sampling rate of the recording in Hz. Defaults to 30_000.
+    bounds (tuple(int)): bounds in 
 
     Returns:
     dict: A dictionary containing the extracted waveforms, where the keys are unit IDs and the values are 2D arrays of waveforms.
@@ -686,15 +768,17 @@ def extract_waveforms(recording, sorting, unit_df, pre=0.001, post=0.002, n_wave
     assert recording.is_filtered()
 
     pre, post = pre * sr, post * sr
-
     id_column = "id" if "id" in unit_df.columns else "cluster_id"
 
     waveform_d = {row[id_column]: np.zeros((n_waveforms, int(pre+post))) for _, row in unit_df.iterrows() if row.group==label}
-
     unit_df = unit_df.loc[unit_df.group==label]
 
     for row_i, row in tqdm.tqdm(unit_df.iterrows(), total=len(unit_df)):
         spiketrain = sorting.get_unit_spike_train(unit_id=row[id_column]).flatten()
+        if bounds is not None:
+            spiketrain = spiketrain[(spiketrain > bounds[0]) & (spiketrain < bounds[1])]
+            if len(spiketrain) == 0:
+                continue
         
         # Randomly sample spikes
         sub_spiketrain = np.random.choice(spiketrain, n_waveforms, replace=True)
@@ -767,6 +851,7 @@ def plot_units_on_probe(unit_df, NP1, waveform_d, normalize=True, ax=None, color
         ax.plot(x + xcoords, avg_waveform.T + ycoords, linewidth=1, color=color)
         ax.plot(x + xcoords, waveforms.T + ycoords, linewidth=1, color=color)
     return ax
+
 
 def parse_param_string(param_string):
     """
