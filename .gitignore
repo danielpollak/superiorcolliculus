@@ -1,0 +1,24 @@
+# cache
+*.pyc
+*.nbc
+*.nbi
+*.pyo
+*.pyd
+*.pdb
+*.egg-info
+*.egg
+*.whl
+*.so
+*.lib
+*.dll
+*.obj
+*.os
+
+
+**/ipynb_checkpoints
+superiorcolliculus/__pycache__/
+superiorcolliculus/peakx/
+build/
+*~
+.*.un~
+
