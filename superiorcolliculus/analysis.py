@@ -634,33 +634,31 @@ def get_lagged_design_matrix(predictor, d_past, d_future=0):
         d (number): Number of time lags to use.
     Returns
         X (2D array): GLM design matrix with shape T, d
+
+    Thin wrapper around build_lag_matrix (processing.py) — kept for
+    backward compatibility with existing callers/column ordering
+    (past block oldest-to-newest ending in the current sample, then
+    future block nearest-to-farthest), rather than build_lag_matrix's own
+    causal/acausal column convention.
     """
     assert (d_past > 0) or (d_future > 0)
 
-    past_padded_stim, future_padded_stim = predictor, predictor
+    predictor = np.asarray(predictor, dtype=np.float64).reshape(-1)
+    parts = []
+    if d_past > 0:
+        # causal mode: column c = predictor[t - c] (c=0 current, increasing
+        # = further past). Reversing columns gives oldest-to-newest ending
+        # at the current sample, i.e. get_lagged_design_matrix's "past" block.
+        X_past, _ = build_lag_matrix(predictor, d_past, mode="causal", dtype=np.float64)
+        parts.append(X_past[:, ::-1])
+    if d_future > 0:
+        # acausal mode: column c = predictor[t + c] (c=0 current, increasing
+        # = further future). Drop c=0 (already covered by the past block's
+        # last column) to get strictly-future columns, nearest-to-farthest.
+        X_future, _ = build_lag_matrix(predictor, d_future + 1, mode="acausal", dtype=np.float64)
+        parts.append(X_future[:, 1:])
 
-
-    # You subtract one to make sure that the first line has only one non-padded element.
-    past_padded_stim = np.concatenate([np.zeros(max(0,d_past - 1)), predictor.T])
-
-    # Same playbook as above, but with future. So flip it around
-    future_padded_stim = np.concatenate([predictor.T, np.zeros(d_future)])
-    
-    
-    # Construct a matrix where each row has the d frames of
-    # the stimulus preceding and including timepoint t
-    T = len(predictor)  # Total number of timepoints
-    X = np.zeros((T, d_past + d_future))
-
-    for t in range(T):
-
-        sl_past = past_padded_stim[t:t+d_past]
-        # Flip back around so it is in the right order
-        sl_future = future_padded_stim[t+1:t+d_future+1]
-
-        X[t,:] = np.concatenate([sl_past, sl_future])
-    
-    return X
+    return np.concatenate(parts, axis=1)
 
 
 def crosscorr(x,y):

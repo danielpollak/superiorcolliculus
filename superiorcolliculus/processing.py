@@ -155,6 +155,73 @@ def medfilt_smooth(arr, MEDFILT_KERNEL_SIZE=5):
     return medfilt(arr.real, MEDFILT_KERNEL_SIZE) + medfilt(arr.imag, MEDFILT_KERNEL_SIZE)*1j
 
 
+def build_lag_matrix(data, L, mode="causal", dtype=np.float64):
+    """Build a causal, acausal, or symmetric lag matrix.
+
+    Accepts either a single timeseries (T,) or a stack of timeseries (N, T)
+    — e.g. one row per spike train or per behavioral signal.
+
+    mode="causal"    X[t, i*n_lags + c] = data[i, t - c]
+                     c in [0, L-1]; c=0 current, c>0 past frames.
+                     shape (T, N*L).
+
+    mode="acausal"   X[t, i*n_lags + c] = data[i, t + c]
+                     c in [0, L-1]; c=0 current, c>0 future frames.
+                     shape (T, N*L).
+
+    mode="symmetric" X[t, i*n_lags + c] = data[i, t - (c - L)]
+                     c in [0, 2L]; c=0 -> L frames future, c=L -> current,
+                     c=2L -> L frames past. shape (T, N*(2L+1)).
+
+    Causal and acausal produce identical shapes (T, N*L), so metrics computed
+    on them are directly comparable. Symmetric has twice as many features
+    per row. Boundary conditions: zero-padding.
+
+    For 1-D input (T,), N=1 and the output is simply (T, n_lags) with no
+    row-interleaving — this is the scalar/single-signal case (e.g. one
+    behavioral timeseries).
+
+    Parameters
+    ----------
+    data  : (T,) or (N, T) array-like
+    L     : int — number of lags (half-width for symmetric)
+    mode  : {"causal", "acausal", "symmetric"}
+    dtype : output dtype (default float64; pass np.float32 for large
+            multi-row matrices where memory matters, e.g. spike trains)
+
+    Returns
+    -------
+    X      : (T, N*n_lags) (or (T, n_lags) for 1-D input) array of `dtype`
+    n_lags : int — L for causal/acausal, 2L+1 for symmetric
+    """
+    data = np.asarray(data, dtype=dtype)
+    if data.ndim == 1:
+        data = data[None, :]
+    N, T = data.shape
+
+    if mode == "symmetric":
+        n_lags = 2 * L + 1
+        X = np.zeros((T, N * n_lags), dtype=dtype)
+        for c in range(n_lags):
+            offset = c - L          # negative=future, zero=current, positive=past
+            if offset == 0:
+                X[:, c::n_lags] = data.T
+            elif offset > 0:        # past: data[i, t - offset]
+                X[offset:, c::n_lags] = data[:, :-offset].T
+            else:                   # future: data[i, t + |offset|]
+                X[:T + offset, c::n_lags] = data[:, -offset:].T
+    else:
+        n_lags = L
+        X = np.zeros((T, N * n_lags), dtype=dtype)
+        for c in range(L):
+            if c == 0:
+                X[:, c::n_lags] = data.T
+            elif mode == "causal":  # past: data[i, t - c]
+                X[c:, c::n_lags] = data[:, :-c].T
+            else:                   # future: data[i, t + c]
+                X[:T - c, c::n_lags] = data[:, c:].T
+    return X, n_lags
+
 
 def phasor(angle):
     """
