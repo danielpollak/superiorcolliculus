@@ -14,8 +14,9 @@ import imageio
 from .analysis import *
 from .processing import *
 
-from spikeinterface.preprocessing import bandpass_filter
-import spikeinterface.widgets as sw
+# Phasing out spikeinterface
+# from spikeinterface.preprocessing import bandpass_filter
+# import spikeinterface.widgets as sw
 
 #https://stackoverflow.com/questions/26108436/how-can-i-get-the-matplotlib-rgb-color-given-the-colormap-name-boundrynorm-an
 import matplotlib as mpl
@@ -334,24 +335,27 @@ def set_axis_units(ax, conversion_rate):
     ax.set_ylabel("cm")
 
 
-def format_behavior_ax(ax, scalebar_color="k"):
+def format_behavior_ax(ax, scalebar_color="k", flip_scalebar_label=False, fontsize=20, bar_y = 1 * conversion_rate):
     """Format the axis for the behavior plots
     Set x/y limits, remove ticks, and set aspect ratio
-    Add a scale bar"""
+    Add a scale bar
+
+    flip_scalebar_label: set True when the y-axis is inverted (imshow or
+        invert_yaxis), so the label lands visually above rather than below.
+    """
     ax.set_xlim((0, 900))
     ax.set_ylim((0, 800))
     ax.axis("equal")
-    # remove gridlines on the axis
-    # Make a 10 cm scale bar
-    ax.plot([10 * conversion_rate, 20 * conversion_rate], [1 * conversion_rate, 1 * conversion_rate], c=scalebar_color, lw=2)
-    ax.text(10 * conversion_rate, 3 * conversion_rate, "10 cm", fontsize=10, color=scalebar_color)
+    
+    label_y = bar_y - 2 * conversion_rate if flip_scalebar_label else bar_y + 2 * conversion_rate
+    ax.plot([10 * conversion_rate, 20 * conversion_rate], [bar_y, bar_y], c=scalebar_color, lw=2)
+    ax.text(10 * conversion_rate, label_y, "10 cm", fontsize=fontsize, color=scalebar_color)
     ax.set_xticklabels([])
     ax.set_yticklabels([])
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_xlabel("")
     ax.set_ylabel("")
-    # To agree the DLC with the video, which is inverted by DLC.
     ax.grid(False)
 
 def generate_event_triggered_maps(event_df, behavior, DLC_metric, win=10, ax=None):
@@ -558,7 +562,7 @@ def plot_annot_timeseries(recording, sorting, unit_df, time_range, ax, markersiz
 
     # Get channels
     channel_ids = unit_df.ch.unique()[:N_chan]
-    sw.plot_timeseries(bandpass_filter(recording), channel_ids=channel_ids, time_range=time_range, ax=ax)
+    # sw.plot_timeseries(bandpass_filter(recording), channel_ids=channel_ids, time_range=time_range, ax=ax)
 
     # Get units on those channels
     channel_to_unit_d = {}
@@ -693,8 +697,8 @@ def plot_k_N(res, Phi, axes, labelk, labelN):
     axes[0].plot(X, k * X,  color="grey", zorder=-np.inf)
     axes[1].plot(X, N * np.ones_like(X),  color="grey", zorder=-np.inf)
     
-    axes[0].set(xlabel="$\Phi$ (deg)", ylabel="$k \Phi$")
-    axes[1].set(xlabel="$\Phi$ (deg)", ylabel="$N$")
+    axes[0].set(xlabel=r"$\Phi$ (deg)", ylabel=r"$k \Phi$")
+    axes[1].set(xlabel=r"$\Phi$ (deg)", ylabel="$N$")
     
     for ax in axes.flatten():
         if np.sum(np.abs(ax.get_ylim())) < 1e-5:
@@ -709,7 +713,7 @@ def plot_contrib_trace(t_df, x, contrib_axes, model_name, fps):
     Parameters
     ----------
     t_df : pd.DataFrame
-        dataframe with thetadot, Phidot, Phidot, alphadot
+        dataframe with thetadot, Phidot, Phidot, adot
     x : (np.array) parameters
     contrib_axes : list
         list of axes to plot D, r, and prediction
@@ -719,7 +723,7 @@ def plot_contrib_trace(t_df, x, contrib_axes, model_name, fps):
     fps : int
         frames per second of the video
     """
-    t_Phi, t_alphadot, thetadot = t_df.Phi.values,t_df.alphadot.values,  t_df.thetadot.values
+    t_Phi, t_adot, thetadot = t_df.Phi.values,t_df.alphadot.values,  t_df.thetadot.values
     
     model_fun = {
         "proportional pursuit": (
@@ -727,43 +731,42 @@ def plot_contrib_trace(t_df, x, contrib_axes, model_name, fps):
         "biased proportional pursuit": (
             lambda x, t_Phi=t_Phi: x[0] * t_Phi + np.sign(t_Phi) * x[1]),
         "parallel navigation":(
-            lambda x, t_Phi=t_Phi, t_alphadot=t_alphadot: x[0] * t_alphadot),
+            lambda x, t_Phi=t_Phi, t_adot=t_adot: x[0] * t_adot),
         "mixed":(
-            lambda x, t_Phi=t_Phi, t_alphadot=t_alphadot: x[0] * t_Phi + x[1] * t_alphadot),
+            lambda x, t_Phi=t_Phi, t_adot=t_adot: x[0] * t_Phi + x[1] * t_adot),
     }[model_name]
 
     x_t = np.arange(len(t_df)) / fps
     tau, tau1 = t_df.tau.values[0], t_df.tau1.values[0]
 
     # Plot ground truth first
-    contrib_axes[2].plot(x_t, thetadot, label=r"$\dot{\theta}$ ground truth", color="grey")
-    contrib_axes[2].set(ylabel=r"$\dot{\theta}$ (deg/s)")
+    contrib_axes[1].plot(x_t, thetadot, label=r"$\dot{\theta}$ ground truth", color="grey")
+    contrib_axes[1].scatter(x_t, thetadot, c=t_df.speed.values if model_name=="proportional pursuit" else t_df.dist.values)
+    contrib_axes[1].set(ylabel=r"$\dot{\theta}$ (deg/s)")
 
     # Plot prediction
     prediction = model_fun(x)
-    contrib_axes[2].plot(x_t, prediction, label=f"prediction", linewidth=1, color="r")
+    contrib_axes[1].plot(x_t, prediction, label=f"prediction", linewidth=1, color="r")
 
 
     # Now plot contributions
-    if "mixed" in model_name:
-        contrib_axes[0].plot(x_t, t_Phi, color="blue")
-        contrib_axes[1].plot(x_t, t_alphadot, color="c")
-        contrib_axes[2].plot(x_t, x[0] * t_Phi,      label=r"$\Phi$",         linewidth=1, color="b")
-        contrib_axes[2].plot(x_t, x[1] * t_alphadot, label=r"$\dot{\alpha}$", linewidth=1, color="c")
+    # if "mixed" in model_name:
+    #     contrib_axes[0].plot(x_t, t_Phi, color="blue")
+    #     contrib_axes[1].plot(x_t, t_adot, color="c")
+    #     contrib_axes[2].plot(x_t, x[0] * t_Phi,      label=r"$\Phi$",         linewidth=1, color="b")
+    #     contrib_axes[2].plot(x_t, x[1] * t_adot, label=r"$\dot{\alpha}$", linewidth=1, color="c")
     
-    elif "proportional pursuit" in model_name:
+    if "proportional pursuit" in model_name:
         contrib_axes[0].plot(x_t, t_Phi, color="blue")
-
+        contrib_axes[0].set(ylabel=r"$\Phi$ (deg)")
     elif "parallel" in model_name:
-        contrib_axes[1].plot(x_t, t_alphadot, color="c")
-
+        contrib_axes[0].plot(x_t, t_adot, color="c")
+        contrib_axes[0].set(ylabel=r"$\dot{\alpha}$", )
 
     # plt.suptitle(f"VAF: {get_VAF(thetadot, prediction):.2f}\nMAE: {MAE(thetadot, prediction):.2f}")
-    contrib_axes[0].set(ylabel=r"$\Phi$ (deg)")
-    contrib_axes[1].set(ylabel=r"$\dot{\alpha}$", )
-    contrib_axes[2].set(xlabel="Time (s)")
+    contrib_axes[1].set(xlabel="Time (s)", ylim=(-800, 800))
 
-    contrib_axes[2].legend(loc="right", bbox_to_anchor=(1.2, 0.5), fontsize=8)
+    contrib_axes[1].legend(loc="right", bbox_to_anchor=(1.2, 0.5), fontsize=8)
 
 
 

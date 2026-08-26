@@ -277,6 +277,7 @@ def guidance_law(parameters, experimental_data, tau, tau1, mode):
             
             dtheta_dt = get_thetadot_PR(alpha[0], dalpha_dt, D_sigma, D_A,  r_sigma, r_A)
         elif mode == 6:
+            # CATD
             dtheta_dt = par_nav_dtheta_dt_Phi(Phi_queue, alpha_queue, parameters)
         elif mode == 7:
             distance = np.abs(target_position - coords[i]) # distance to target
@@ -397,7 +398,11 @@ def residual_variance(prediction, ground_truth):
 
 
 def get_VAF(prediction, ground_truth):
-    return 1-((residual_variance(prediction, ground_truth) / np.var(ground_truth)))
+    GT_var = np.var(ground_truth)
+    if GT_var == 0:
+        return np.nan
+    else:
+        return 1 - ((residual_variance(prediction, ground_truth) / GT_var))
 
 
 def MAE(prediction, ground_truth):
@@ -602,8 +607,8 @@ def get_directional_variables(pos, target_positions, fps, body_angle_vectors=Non
     thetadot = dangle_dt(headings) # deg/frame
     thetadot = thetadot / IFI # deg/s
 
-    # alphadot
-
+    # alpha: allocentric LOS angle (deg); alphadot: its angular velocity (deg/s)
+    alpha    = np.angle(LOS, deg=True)
     alphadot = dangle_dt(LOS) / IFI # deg/s
 
     # bearing, theta_e, in phasor
@@ -612,10 +617,11 @@ def get_directional_variables(pos, target_positions, fps, body_angle_vectors=Non
 
     assert not np.iscomplexobj(thetadot)
     assert not np.iscomplexobj(phi)
+    assert not np.iscomplexobj(alpha)
     assert not np.iscomplexobj(alphadot)
     assert not np.iscomplexobj(phidot)
 
-    return thetadot, phi, alphadot, phidot
+    return thetadot, phi, alpha, alphadot, phidot
 
 
 def get_lagged_design_matrix(predictor, d_past, d_future=0):
@@ -672,46 +678,47 @@ def crosscorr(x,y):
         "same")
 
 
-def add_two_delays(df, Phi_tau, Phidot_tau):
+def add_two_delays(df, Phi_tau, alphadot_tau):
     """If taus are different, then arrays will not be same lengths.
     To deal with this, we shift the whole dataframe by the maximum of the two taus.
-    Then, phi and phi dot are cut from the end by Phi_tau and Phidot_tau respectively.
+    Then, phi and phi dot are cut from the end by Phi_tau and alphadot_tau respectively.
     If taus are different, then we cut the difference in taus from the beginning of the longer one.
     This preserves the temporal lags of all of them.
     
-    I am confusingly interested in both phidot and alphadot. Unfortunately I do need to shift both. Therefore, I will
-    shift alphadot with phidot_tau for now.
-
     Parameters
     -----------
     df : pd.DataFrame
-    A_phi : int time delay for Phi
-    B_phidot : int time delay for Phidot
+    Phi_tau : int time delay for Phi and Phidot (frames)
+    alphadot_tau : int time delay for alphadot and alpha (frames)
     """
-    assert (Phi_tau >= 0) & (Phidot_tau >= 0), "tau must be non-negative"
-    
-    # Shift phi and phidot
-    Phi    = df.Phi.values[:-Phi_tau if Phi_tau > 0 else None]
-    Phidot = df.Phidot.values[:-Phidot_tau if Phidot_tau > 0 else None]
-    alphadot=df.alphadot.values[:-Phidot_tau if Phidot_tau > 0 else None]
-    
-    if Phi_tau != Phidot_tau:
-        # If different, then cut the difference in taus from the longer one. That's equivalent to cutting the theta two different ways.
-        front = np.abs(Phi_tau - Phidot_tau)
+    assert (Phi_tau >= 0) & (alphadot_tau >= 0), "tau must be non-negative"
 
-        # Make them the same length
-        if Phi_tau > Phidot_tau:
-            Phidot = Phidot[front:]
-            alphadot=alphadot[front:]
+    # Phidot = dPhi/dt, so it uses the same delay as Phi (Phi_tau), not alphadot_tau.
+    # alphadot and alpha use alphadot_tau.
+    Phi      = df.Phi.values[:-Phi_tau if Phi_tau > 0 else None]
+    Phidot   = df.Phidot.values[:-Phi_tau if Phi_tau > 0 else None]
+    alphadot = df.alphadot.values[:-alphadot_tau if alphadot_tau > 0 else None]
+    alpha    = df.alpha.values[:-alphadot_tau if alphadot_tau > 0 else None]
+
+    if Phi_tau != alphadot_tau:
+        # Cut the difference in taus from the front of the longer array so all
+        # arrays align with the same thetadot segment (offset by max tau).
+        front = np.abs(Phi_tau - alphadot_tau)
+
+        if Phi_tau > alphadot_tau:
+            alphadot = alphadot[front:]
+            alpha    = alpha[front:]
         else:
-            Phi = Phi[front:]
-    
+            Phi    = Phi[front:]
+            Phidot = Phidot[front:]
+
     # frontshift all and replace the phi and phidot separately
-    tau = max(Phi_tau, Phidot_tau)
+    tau = max(Phi_tau, alphadot_tau)
     output_df = df.copy().iloc[tau:]
-    output_df["Phi"] = Phi
-    output_df["Phidot"] = Phidot
+    output_df["Phi"]      = Phi
+    output_df["Phidot"]   = Phidot
     output_df["alphadot"] = alphadot
+    output_df["alpha"]    = alpha
 
     return output_df
     
@@ -746,7 +753,27 @@ def get_contingency(avi_str):
         return None
 
 
-def get_pursuit_data(subject_l, tau_phi=0, tau_phidot=0):
+def radius_of_curvature(x, y, t):
+    """
+    Parameter
+    ---------
+    x, y: 
+    t: time
+    """
+    # Calculate first and second derivatives
+    dx = np.gradient(x, t)
+    dy = np.gradient(y, t)
+    ddx = np.gradient(dx, t)
+    ddy = np.gradient(dy, t)
+    
+    # Calculate curvature radius
+    numerator = (dx**2 + dy**2)**(3/2)
+    denominator = np.abs(dx * ddy - ddx * dy)
+    denominator[denominator == 0] = np.nan  # Avoid division by zero
+    R = (numerator / denominator)
+    return R
+
+def get_bh_data(subject_l, behavior="all"):
     """Data guidance law for each subject 
     example inputs;
     cortical: ["SC5",  "SC8", "SC16", "SC44","SC7",]
@@ -761,78 +788,175 @@ def get_pursuit_data(subject_l, tau_phi=0, tau_phidot=0):
     tau : int
     """
     bout_df_l = []
-    for subject in subject_l: #: # :, 
+    for subject in subject_l:
         # approach vs nonapproach
         avi_boris_HD = match_avi_boris_dlc(r'\\datanas\family\SC\data_agg\behavior' + f'/{subject}\\*')
-        for gv_d in behavior_bout_generator(avi_boris_HD, conversion_rate, behavior="approach", warnings=False):
+        for gv_d in behavior_bout_generator(avi_boris_HD, conversion_rate, behavior=behavior, warnings=False):
             
             # Event-level variables
-            rm_d, win, avi, event_ind = gv_d["relevant_measures"], gv_d["win"], gv_d["avi"], gv_d["event_ind"]
+            rm_d, avi, event_ind, boris_df = gv_d["relevant_measures"], gv_d["avi"], gv_d["event_ind"], gv_d["boris_df"]
             
+            nframe = int(cv2.VideoCapture(avi).get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            # Inter-frame interval (s)
+            fps = cv2.VideoCapture(avi).get(cv2.CAP_PROP_FPS)
+            
+            bh = boris_to_array(boris_df, nframe)  # boris_df
             # Whole-video level variables
             head_vector =  rm_d["head_vector"]
             body_vector = rm_d["body_vector"]
             (neck_x, neck_y), (snout_x, snout_y), (target_x, target_y) = rm_d["neck"], rm_d["snout"], rm_d["target"]
             
+            dist = rm_d["dist"]
+            
+
+            pos, target = (neck_x + neck_y * 1j), (target_x + target_y * 1j)
+            
+            # Filter tangent variables due to their high frequency noise
+            MEDFILT_KERNEL_SIZE = 5
+            if len(pos) <= MEDFILT_KERNEL_SIZE: # medfilt kernel size
+                continue
+            
+            dist = rm_d['dist'] # cm/s
+            speed = np.concatenate([np.array([0]), get_speed_timeseries(pos.real, pos.imag, interval=1, fps=fps)])
+
+            pos_RC = radius_of_curvature(pos.real, pos.imag, np.arange(len(pos)) / fps)
+            tar_RC = radius_of_curvature(target.real, target.imag, np.arange(len(target)) / fps)
+
+            tan_thetadot, tan_Phi, alpha, alphadot, tan_Phidot = get_directional_variables(pos, target, fps)
+
+            common_args = {
+                "alpha":alpha, "alphadot":alphadot, "pos":pos, "target":target, "behavior":bh,
+                "dist":dist, "ddist":np.diff(dist, prepend=dist[0]), "subject":subject, "avi":avi, "event ind":event_ind,
+                "speed":speed, "pos_RC":pos_RC, "tar_RC":tar_RC, "t":np.arange(len(pos))}
+
+            tan_theta = np.concatenate([[np.diff(pos)[0]], np.diff(pos)])
+            bout_df = pd.DataFrame({
+                "theta":tan_theta, "thetadot":tan_thetadot,
+                "Phi":tan_Phi, "Phidot":tan_Phidot, 
+                "mode":"tangent","ego":np.nan,**common_args})
+
+            bout_df_l.append(add_two_delays(bout_df, 0,0))
+
+
+            HD_thetadot, HD_Phi, _, _, HD_Phidot = get_directional_variables(pos, target, fps, head_vector)
+            bout_df = pd.DataFrame({
+                "theta":head_vector, "thetadot":HD_thetadot,
+                "Phi":HD_Phi, "Phidot":HD_Phidot,
+                "ego": rm_d["ego_angle"],"mode":"HD", **common_args})
+
+            bout_df_l.append(add_two_delays(bout_df, 0,0))
+
+            # alpha and alphadot are the same regardless of whether you're getting the bearing for HD or BD
+            BD_thetadot, BD_Phi, _, _, BD_Phidot = get_directional_variables(pos, target, fps, body_vector)
+            bout_df = pd.DataFrame({
+                "theta":body_vector, "thetadot":BD_thetadot,
+                "Phi":BD_Phi, "Phidot":BD_Phidot,
+                "ego":np.nan, "mode":"BD",**common_args})
+
+            bout_df_l.append(add_two_delays(bout_df, 0,0))
+
+            # Only do it for the first bout
+            break
+
+    bout_df = pd.concat(bout_df_l)
+
+    return pd.concat(bout_df_l)
+
+
+def get_pursuit_data(subject_l, tau_phi=0, tau_alphadot=0, smoothing_sigma=0):
+    """Data guidance law for each subject
+    example inputs;
+    cortical: ["SC5",  "SC8", "SC16", "SC44","SC7",]
+    acortical: ["SC9", 'SC17',"SC51"]
+
+    Parameters
+    ----------
+    subject_l : list
+        list of subjects
+    function : function
+        function to get thetadot, Phi, alphadot
+    tau : int
+    smoothing_sigma : float
+        Gaussian smoothing sigma (frames) applied to pos and target position
+        timeseries before computing kinematic variables. 0 means no smoothing.
+    """
+    bout_df_l = []
+    for subject in subject_l: #: # :,
+        # approach vs nonapproach
+        avi_boris_HD = match_avi_boris_dlc(r'\\datanas\family\SC\data_agg\behavior' + f'/{subject}\\*')
+        for gv_d in behavior_bout_generator(avi_boris_HD, conversion_rate, behavior="approach", warnings=False):
+
+            # Event-level variables
+            rm_d, win, avi, event_ind = gv_d["relevant_measures"], gv_d["win"], gv_d["avi"], gv_d["event_ind"]
+
+            # Whole-video level variables
+            head_vector =  rm_d["head_vector"]
+            body_vector = rm_d["body_vector"]
+            (neck_x, neck_y), (snout_x, snout_y), (target_x, target_y) = rm_d["neck"], rm_d["snout"], rm_d["target"]
+
+            dist = rm_d["dist"]
             # Inter-frame interval (s)
             fps = cv2.VideoCapture(avi).get(cv2.CAP_PROP_FPS)
+
 
             full_pos, full_target_positions = (neck_x + neck_y * 1j), (target_x + target_y * 1j)
             pos, target = full_pos[slice(*win)], full_target_positions[slice(*win)]
 
-            dist = np.sqrt((snout_x[slice(*win)] - target_x[slice(*win)])**2 + (snout_y[slice(*win)] - target_y[slice(*win)])**2) / conversion_rate
-
-            tan_thetadot, tan_Phi, alphadot, tan_Phidot = get_directional_variables(pos, target, fps)
-            # Filter tangent variables due to their high frequency noise
-            order = 2
-            W = .2
-            '''tan_thetadot = scipy.signal.filtfilt(
-                *scipy.signal.butter(order, W, btype='lowpass', analog=False, output='ba'),
-                tan_thetadot) if len(tan_thetadot) > 10 else tan_thetadot # because of issues with short bouts
-            tan_Phi = scipy.signal.filtfilt(
-                *scipy.signal.butter(order, W, btype='lowpass', analog=False, output='ba'),
-                tan_Phi) if len(tan_Phi) > 10 else tan_Phi
-            # alphadot = scipy.signal.filtfilt(*scipy.signal.butter(order, W, btype='lowpass', analog=False, output='ba'),alphadot) if len(alphadot) > 10 else alphadot
-            tan_Phidot = scipy.signal.filtfilt(
-                *scipy.signal.butter(order, W, btype='lowpass', analog=False, output='ba'),
-                tan_Phidot) if len(tan_Phidot) > 10 else tan_Phidot'''
-            tan_thetadot = scipy.signal.medfilt(tan_thetadot, 5)# because of issues with short bouts
-            tan_Phi = scipy.signal.medfilt(tan_Phi, 5)
-            alphadot = scipy.signal.medfilt(alphadot, 5)
-            tan_Phidot = scipy.signal.medfilt(tan_Phidot)
+            if smoothing_sigma > 0:
+                pos    = smooth(pos.real,    smoothing_sigma) + 1j * smooth(pos.imag,    smoothing_sigma)
+                target = smooth(target.real, smoothing_sigma) + 1j * smooth(target.imag, smoothing_sigma)
             
+            # Filter tangent variables due to their high frequency noise
+            MEDFILT_KERNEL_SIZE = 5
+            if len(pos) <= MEDFILT_KERNEL_SIZE: # medfilt kernel size
+                continue
+            
+            dist = rm_d['dist'][slice(*win)] # cm/s
+            speed = np.concatenate([np.array([0]), get_speed_timeseries(pos.real, pos.imag, interval=1, fps=fps)])
 
-            bout_df = pd.DataFrame(
-                {"theta":np.concatenate([[np.diff(pos)[0]], np.diff(pos)]),
-                 "thetadot":tan_thetadot, "Phi":tan_Phi, "Phidot":tan_Phidot, "alphadot":alphadot,
-                 "pos":pos, "target":target, "dist":dist, "subject":subject, "tau":tau_phi, "tau1":tau_phidot, "ego":np.nan,
-                 "mode":"tangent", "avi":avi, "event ind":event_ind})
+            body_unit_win = body_vector[slice(*win)] / np.abs(body_vector[slice(*win)])
+            v_complex = np.diff(pos, prepend=pos[0]) * fps / conversion_rate
+            v_proj = v_complex * np.conj(body_unit_win)
+            v_forward = np.real(v_proj)  # cm/s; positive = forward (tailbase→neck), negative = backward
+            v_lateral = np.imag(v_proj)  # cm/s; positive = rightward from mouse's perspective
 
-            bout_df_l.append(add_two_delays(bout_df, tau_phi, tau_phidot))
+            pos_RC = radius_of_curvature(pos.real, pos.imag, np.arange(len(pos)) / fps)
+            tar_RC = radius_of_curvature(target.real, target.imag, np.arange(len(target)) / fps)
 
+            tan_thetadot, tan_Phi, alpha, alphadot, tan_Phidot = get_directional_variables(pos, target, fps)
 
-            HD_thetadot, HD_Phi, _, HD_Phidot = get_directional_variables(pos, target, fps, head_vector[slice(*win)])
-            HD_thetadot = scipy.signal.medfilt(HD_thetadot, 5)
-            HD_Phi = scipy.signal.medfilt(HD_Phi, 5)
-            HD_Phidot = scipy.signal.medfilt(HD_Phidot, 5)
-            bout_df = pd.DataFrame(
-                {"theta":head_vector[slice(*win)], "thetadot":HD_thetadot, "Phi":HD_Phi, "Phidot":HD_Phidot,
-                "alphadot":alphadot,"pos":pos, "dist":dist, "target":target, "behavior":"approach", "subject":subject,
-                "tau":tau_phi, "tau1":tau_phidot, "ego": rm_d["ego_angle"][slice(*win)],"mode":"HD", "avi":avi, "event ind":event_ind})
+            tan_theta = np.concatenate([[np.diff(pos)[0]], np.diff(pos)])
+            bout_df = pd.DataFrame({"theta":tan_theta,
+                 "thetadot":tan_thetadot, "Phi":tan_Phi, "Phidot":tan_Phidot,
+                 "alpha":alpha, "alphadot":alphadot,
+                 "pos":pos, "target":target, "behavior":"approach", "dist":dist, "subject":subject, "tau":tau_phi, "tau1":tau_alphadot, "ego":np.nan,
+                 "mode":"tangent", "avi":avi, "event ind":event_ind, "speed":speed, "pos_RC":pos_RC, "tar_RC":tar_RC,
+                 "v_forward":v_forward, "v_lateral":v_lateral})
 
-            bout_df_l.append(add_two_delays(bout_df, tau_phi, tau_phidot))
+            bout_df_l.append(add_two_delays(bout_df, tau_phi, tau_alphadot))
 
-            # Alphadot is the same regaDrless of whether you're getting the bearing for HD or BD
-            BD_thetadot, BD_Phi, _, BD_Phidot = get_directional_variables(pos, target, fps, body_vector[slice(*win)])
-            BD_thetadot = scipy.signal.medfilt(BD_thetadot, 5)
-            BD_Phi = scipy.signal.medfilt(BD_Phi, 5)
-            BD_Phidot = scipy.signal.medfilt(BD_Phidot, 5)
-            bout_df = pd.DataFrame(
-                {"theta":body_vector[slice(*win)],"thetadot":BD_thetadot, "Phi":BD_Phi, "Phidot":BD_Phidot, "alphadot":alphadot,
-                 "pos":pos, "target":target, "dist":dist, "behavior":"approach", "subject":subject, "tau":tau_phi, "tau1":tau_phidot,"ego":np.nan,
-                 "mode":"BD", "avi":avi, "event ind":event_ind})
+            # alpha and alphadot are the same regardless of whether you're getting the bearing for HD or BD
+            HD_thetadot, HD_Phi, _, _, HD_Phidot = get_directional_variables(pos, target, fps, head_vector[slice(*win)])
+            bout_df = pd.DataFrame({"theta":head_vector[slice(*win)], "thetadot":HD_thetadot, "Phi":HD_Phi, "Phidot":HD_Phidot,
+                "alpha":alpha, "alphadot":alphadot, "pos":pos, "dist":dist, "target":target, "behavior":"approach", "subject":subject,
+                "tau":tau_phi, "tau1":tau_alphadot,
+                "ego": rm_d["ego_angle"][slice(*win)],"mode":"HD",
+                "avi":avi, "event ind":event_ind, "speed":speed, "pos_RC":pos_RC, "tar_RC":tar_RC,
+                "v_forward":v_forward, "v_lateral":v_lateral})
 
-            bout_df_l.append(add_two_delays(bout_df, tau_phi, tau_phidot))
+            bout_df_l.append(add_two_delays(bout_df, tau_phi, tau_alphadot))
+
+            BD_thetadot, BD_Phi, _, _, BD_Phidot = get_directional_variables(pos, target, fps, body_vector[slice(*win)])
+            bout_df = pd.DataFrame({"theta":body_vector[slice(*win)],
+                 "thetadot":BD_thetadot, "Phi":BD_Phi, "Phidot":BD_Phidot,
+                 "alpha":alpha, "alphadot":alphadot, "pos":pos, "target":target, "dist":dist,
+                 "behavior":"approach", "subject":subject, "tau":tau_phi, "tau1":tau_alphadot,
+                 "ego":np.nan, "mode":"BD", "avi":avi, "event ind":event_ind,
+                 "speed":speed, "pos_RC":pos_RC, "tar_RC":tar_RC,
+                 "v_forward":v_forward, "v_lateral":v_lateral})
+
+            bout_df_l.append(add_two_delays(bout_df, tau_phi, tau_alphadot))
     
     bout_df = pd.concat(bout_df_l)
 
@@ -900,7 +1024,10 @@ def clean_features(arr):
 
 @njit(cache=True)
 def get_theta_mse(X, spike_counts):
-    """Parameters
+    """
+    Commputes mean mean squared error for STA 
+    I think
+    Parameters
     ----------
     X : array
         Design matrix
@@ -947,22 +1074,22 @@ def fit_LNP(spikes, X, x0, beta=0):
     return res["x"], res
 
 
-def mean_sq_err(Ambtheta, X, y, beta=0):
+def mean_sq_err(Ambtheta, X, y, beta, A):
     """ """
-    A = Ambtheta[0]
-    m = Ambtheta[1]
-    b = Ambtheta[2]
-    theta = Ambtheta[3:]
-    return np.mean((y-sigmoid(X @ theta, A, m, b))**2) + beta*np.sum(theta**2)
+    m = Ambtheta[0]
+    b = Ambtheta[1]
+    theta = Ambtheta[2:]
+    return np.mean((y-sigmoid(X @ theta / len(theta), A, m, b))**2) + beta*np.sum(theta**2)
 
 
-def fit_LNS(spikes, X, x0, beta=0, maxiter=1000):
+def fit_LNS(spikes, X, x0, A, beta=0, maxiter=1000):
     """https://github.com/NeuromatchAcademy/course-content/blob/main/tutorials/W1D3_GeneralizedLinearModels/solutions/W1D3_Tutorial1_Solution_90f0230d.py"""
-    """Obtain MLE parameters for the Sigmoid GLM.
+    """Obtain MLE parameters for the Sigmoid Linear nonlinear model.
+    Not sure why the tutorial says this is about GLMs; this is not a GLM.
     Args:
         spikes (1D array): Spike counts measured at each timepoint
         X (2D array): Full design matrix.
-        x0 (1D array): Initial guess for MLE parameters.
+        x0 (1D array): Initial guess for MLE parameters: m, b.
         beta (float): Regularization parameter.
         maxiter (int): Maximum number of iterations for optimization.
     Returns:
@@ -970,54 +1097,13 @@ def fit_LNS(spikes, X, x0, beta=0, maxiter=1000):
     """
     y = spikes
 
-    # Find parameters that minimize the mean square error function
-    # x0 = (A, m, b, theta)
-    constraints = [
-        {"type":"ineq", "fun": lambda initial_guess: initial_guess[0]}, # A is > 0
-        {"type":"ineq", "fun": lambda initial_guess: initial_guess[1]}, # m is > 0
-        # New addition
-        # theta is within the range of the initial guess
-        # {"type":"ineq", "fun": lambda initial_guess: np.max(np.abs(initial_guess[-1])) <= np.max(np.abs(x0[-1]))}
-    ]
+    # Find parameters that minimize the mean square error function    
+    res = minimize(mean_sq_err, x0, args=(X, y, beta, A), method="Nelder-Mead", options={"maxiter":maxiter})
+    m, b = res["x"][0], res["x"][1]
+    theta = res["x"][2:]
     
-    res = minimize(mean_sq_err, x0, args=(X, y, beta), constraints=constraints, method="trust-constr", options={"maxiter":maxiter})
-    A, m, b = res["x"][0], res["x"][1], res["x"][2]
-    theta = res["x"][3:]
-    
-    return A, m, b, theta, res
+    return m, b, theta, res
 
-
-def GLM_driver(counts, predictor, d=32, beta=0, LNP=False, maxiter=1000):
-    """
-    Parameters
-    ----------
-    counts : (array) Binned spike counts
-    predictor : (array) Stimulus intensity
-    d: (int, optional) Number of time lags to use. The default is 32.
-    beta : (float, optional) Regularization parameter. The default is 0.
-    
-    Returns
-    -------
-    theta_MSE : (array) Raw STA linear filter (initial guess)
-    theta : (array) linear filter after optimizing alongside nonlinearity
-    A : (float) Amplitude
-    m : (float) Slope
-    b : (float) Offset
-    """
-    
-    X = get_lagged_design_matrix(predictor, d=d)
-    # STA
-    theta_MSE = get_theta_mse(X, counts)
-
-    # Fit
-    if LNP:
-        theta = fit_LNP(counts, X, theta_MSE, beta=beta)
-        A, m, b = None, None, None
-    else:
-        A_init = np.max(counts)
-        A, m, b, theta, res = fit_LNS(counts, X, np.concatenate((np.array([A_init, 5, 1]), theta_MSE)), beta=beta, maxiter=maxiter)
-    
-    return theta_MSE, theta, A, m, b, res
 
 
 def plot_GLM(theta_MSE, theta, A, m, b, counts, time, predictor, d, LNP=False, expt="", label="", save=True):
@@ -1034,7 +1120,8 @@ def plot_GLM(theta_MSE, theta, A, m, b, counts, time, predictor, d, LNP=False, e
     time : (array) Time bins
     predictor : (array) Stimulus intensity
     d : (int, optional) Number of time lags to use. The default is 32.
-    beta : (float, optional) Regularization parameter. The default is 0."""
+    beta : (float, optional) Regularization parameter. The default is 0.
+    """
 
     """Visualize kernels"""
     fig, ax = plt.subplots(1,2, figsize=(9,3))
@@ -1047,8 +1134,9 @@ def plot_GLM(theta_MSE, theta, A, m, b, counts, time, predictor, d, LNP=False, e
         x = np.arange(-5,15,0.1)
         ax[1].plot(x, sigmoid(x, A, m, b), label=f"A: {np.round(A,3)}, m: {np.round(m,3)}, b:{np.round(b,3)}")
         ax[1].legend()
-    else: 
-        raise NotImplementedError 
+    # else: 
+    #     ax[1].plot(x, sigmoid(x, A, m, b), label=f"A: {np.round(A,3)}, m: {np.round(m,3)}, b:{np.round(b,3)}")
+    #     ax[1].legend()
     
     if save:
         fig.savefig(r"C:\Users\dan\Documents\SuperiorColliculus\figs\LN" + f"\\{expt}_kernels_{label}.png")
@@ -1057,13 +1145,14 @@ def plot_GLM(theta_MSE, theta, A, m, b, counts, time, predictor, d, LNP=False, e
     """Visualize fits"""
     fig, ax = plt.subplots(2,1,figsize=(10,6))
     ax[0].plot(time, predictor)
-    ax[1].plot(time, counts, label="spike counts", color="k")
-    X = get_lagged_design_matrix(predictor, d)
-    ax[1].plot(time, X @ theta_MSE, label="activation", color="b")
+    X = get_lagged_design_matrix(predictor, d, d)
+    ax_twin = ax[0]
+    ax_twin.plot(time, X @ theta_MSE, label="activation", color="b")
     if LNP:
         ax[1].plot(time, np.exp(X @ theta), label="LNP", color="c")
     else:
         ax[1].plot(time, sigmoid(X @ theta, A, m, b), label="LNS", color="c")
+    ax[1].plot(time, counts, label="spike counts", color="k")
     
     ax[0].set_ylabel("predictor")
     ax[1].set_ylabel("spike counts")
@@ -1090,7 +1179,6 @@ def get_sta_X(X, r):
     assert X.ndim==2, "X should be 2D, got {}".format(X.ndim)
     assert X.shape[0] == r.shape[0], "X and r should have the same number of rows, got {} and {}".format(X.shape[0], r.shape[0])
     assert X.shape[1] > 0, "X should have at least one column, got {}".format(X.shape[1])
-    
     n_spikes = np.sum(r)
     sta = X.T @ r / n_spikes  # Scales to the actual units of what we are looking at # * X.shape[1]
 
@@ -1132,6 +1220,7 @@ def conv_circ( signal, ker ):
         signal: real 1D array
         ker: real 1D array
         signal and ker must have same shape
+    
     '''
     assert len(signal) == len(ker), "signal and ker must have same shape"
     # Circular convolution using FFT
@@ -1224,3 +1313,185 @@ def sorted_eig(mat):
     eigenvalues = eigenvalues[sort_inds]
     eigenvectors = eigenvectors[:, sort_inds]
     return eigenvalues, eigenvectors
+
+
+'''
+# pytorch 
+import torch
+from torch import nn, optim
+import torch.nn.functional as F
+
+class SingleLayerPerceptron(nn.Module):
+  """ network with a single hidden layer h with a RELU """
+
+  def __init__(self, n_inputs):
+    super().__init__()  # needed to invoke the properties of the parent class nn.Module
+    self.in_layer = nn.Linear(n_inputs, 1) # neural activity --> hidden units
+
+  def forward(self, r):
+
+    y = self.in_layer(r)
+
+
+    return y
+
+
+class DeepNet(nn.Module):
+  """ network with a single hidden layer h with a RELU """
+
+  def __init__(self, n_inputs, n_hidden=16):
+    super().__init__()  # needed to invoke the properties of the parent class nn.Module
+    self.in_layer = nn.Linear(n_inputs, n_hidden) # neural activity --> hidden units
+    self.out_layer = nn.Linear(n_hidden, 1) # hidden units --> output
+
+  def forward(self, r):
+   
+    h = self.in_layer(r) # h is size (n_inputs, n_hidden) 
+    y = self.out_layer(h)
+
+
+    return y
+
+
+class DeepNetReLU(nn.Module):
+  """ network with a single hidden layer h with a RELU """
+
+  def __init__(self, n_inputs, n_hidden=16):
+    super().__init__()  # needed to invoke the properties of the parent class nn.Module
+    self.in_layer = nn.Linear(n_inputs, n_hidden) # neural activity --> hidden units
+    self.out_layer = nn.Linear(n_hidden, 1) # hidden units --> output
+
+  def forward(self, r):
+   
+    h = torch.relu(self.in_layer(r)) # h is size (n_inputs, n_hidden) 
+    y = self.out_layer(h)
+
+
+    return y
+
+
+class DeepNetReLU(nn.Module):
+    """Flexible MLP with configurable depth and ReLU nonlinearity."""
+
+    def __init__(self, n_inputs, n_hidden=16, n_layers=1):
+        """
+        n_inputs: number of input features
+        n_hidden: number of hidden units per layer
+        n_layers: number of hidden layers
+        """
+        super().__init__()
+
+        layers = []
+        # Input layer
+        layers.append(nn.Linear(n_inputs, n_hidden))
+        layers.append(nn.ReLU())
+
+        # Hidden layers
+        for _ in range(n_layers - 1):
+            layers.append(nn.Linear(n_hidden, n_hidden))
+            layers.append(nn.ReLU())
+
+        # Output layer
+        layers.append(nn.Linear(n_hidden, 1))
+
+        # Combine all layers into a Sequential model
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+
+class Conv1DTemporalNet(nn.Module):
+    """Multiple layers. not interpretable"""
+    def __init__(self, n_inputs, n_hidden=1, kernel_size=9, n_layers=2):
+        super().__init__()
+
+        # symmetrical padding for forward+backward context
+        padding = kernel_size // 2
+
+        layers = []
+        in_channels = n_inputs
+        for i in range(n_layers):
+            layers.append(nn.Conv1d(in_channels, n_hidden, kernel_size, padding=padding))
+            layers.append(nn.ReLU())
+            # Maxpool & batchnorm?
+            # Add validation loss and if it goes up add dropout for regularization
+            in_channels = n_hidden
+
+        self.conv_stack = nn.Sequential(*layers)
+        self.output_layer = nn.Conv1d(n_hidden, 1, kernel_size=1)
+
+    def forward(self, r):
+        """
+        r: (batch, n_inputs, time)
+        Returns: (batch, 1, time)
+        """
+        h = self.conv_stack(r)
+        y = self.output_layer(h)
+        return y
+    
+
+class DepthwiseTemporalConv(nn.Module):
+    def __init__(self, n_inputs, kernel_size, relu=False):
+        super().__init__()
+        # depthwise convolution: one kernel per input channel
+        self.relu = relu
+        self.depthwise = nn.Conv1d(
+            in_channels=n_inputs,
+            out_channels=n_inputs,
+            kernel_size=kernel_size,
+            groups=n_inputs,   # <--- key: makes it depthwise!
+            padding=kernel_size // 2
+        )
+
+        # linear combination step
+        self.combine = nn.Conv1d(
+            in_channels=n_inputs,
+            out_channels=1,
+            kernel_size=1
+        )
+
+    def forward(self, x):
+        """
+        x: (batch, n_inputs, time)
+        returns: (batch, 1, time)
+        """
+        if self.relu:
+            h = torch.relu(self.depthwise(x))
+        else:
+            h = self.depthwise(x)
+        y = self.combine(h)
+        return y
+
+
+def format_data(X, y, net_class):
+    """
+    Wrangles data for training and testing in convolutinal
+    and non-convolutinal neural nets.
+
+    Assumes train-test split has already happened
+
+    Parameters
+    ----------
+    X: np.array (n_neurons x timepoints)
+    y: np.array (timepoints)
+    
+    Returns
+    -------
+    X_, y_: torch.tensor """
+    assert type(net_class) == type
+    
+    X_ = torch.tensor(X, dtype=torch.float32) 
+    y_ = torch.tensor(y, dtype=torch.float32)
+
+    if (net_class == Conv1DTemporalNet) or (net_class == DepthwiseTemporalConv):
+        
+        X_ = X_.unsqueeze(0)
+        y_ = y_.unsqueeze(0).unsqueeze(0)
+    else:
+        X_ = X_.T
+        y_ = y_.unsqueeze(1)
+    
+    return X_, y_'''
+# %%

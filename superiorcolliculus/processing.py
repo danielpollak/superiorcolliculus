@@ -1,21 +1,23 @@
-import pandas as pd
+import os
 import numpy as np
+
+import pandas as pd
 import glob
 import cv2
 import matplotlib.pyplot as plt
 import tqdm.auto as tqdm
 import warnings
-import os
-import scipy.io
-import scipy.ndimage as nd
 
+import scipy.ndimage as nd
+from scipy.interpolate import CubicSpline
+from scipy.signal import medfilt
+import scipy.io
 from numba import njit
 
 from .analysis import *
 
 conversion_rate = 820 / 18 / 2.54  # pixels per cm
 
-from scipy.interpolate import CubicSpline
 
 def interpolate_cubic_spline(data):
     # Indices of valid (non-NaN) and invalid (NaN) values
@@ -35,17 +37,122 @@ def interpolate_cubic_spline(data):
     return data
 
 
-def smooth(arr):
+def smooth(arr, sigma=2):
     """Just uses scipy's gaussian filter for non-angle data
 
     Does different things if arr is complex or not.
     Parameters
     ----------
-    arr: np.array 
+    arr: np.array, can be complex
+    sigma: int or float sigma for gaussian smoothing
     """
-    return nd.gaussian_filter1d(arr, 1)
+    return nd.gaussian_filter1d(arr, sigma)
 
 
+def semiflatten(x, d=0):
+    """Move axis d to the last position and collapse all remaining axes into one.
+
+    Returns (y, s) where y is 2-D (K, L) with L = x.shape[d] and K = product
+    of all other dimensions.  s is an opaque token for semiunflatten.
+    """
+    x = np.asarray(x)
+    d = d % x.ndim
+    rest = tuple(s for i, s in enumerate(x.shape) if i != d)
+    y = np.moveaxis(x, d, -1).reshape(-1, x.shape[d])
+    return y, (d, np.array(rest, dtype=int))
+
+
+def semiunflatten(y, s):
+    """Inverse of semiflatten: restore original shape and axis order."""
+    d, rest = s
+    x = y.reshape((*rest, y.shape[-1]))
+    return np.moveaxis(x, -1, d)
+
+
+def fupsample(x, n, t=None, axis=0, taper=0.0):
+    """Fourier (sinc) upsampling by integer factor n along a given axis.
+
+    Inserts n-1 evenly-spaced samples between each pair of original samples by
+    zero-padding the DFT spectrum.  The result is a band-limited interpolant
+    that passes exactly through all original sample values.
+
+    Parameters
+    ----------
+    x : array-like
+        Input signal (real or complex).
+    n : int
+        Upsampling factor (n=1 returns x unchanged).
+    t : 1-D array, optional
+        Time-stamps of x along `axis`.  If given, returns interpolated
+        time-stamps instead of pseudo-indices.
+    axis : int
+        Axis along which to upsample (default 0).
+    taper : float in [0, 1)
+        Fraction of the half-spectrum to roll off with a raised-cosine window
+        before zero-padding.  Attenuates the highest-frequency content to
+        reduce Gibbs ringing without distorting time-domain signal values.
+        0 (default) = pure sinc interpolation; ~0.1–0.2 is typically enough.
+
+    Returns
+    -------
+    y : ndarray
+        Upsampled signal with shape[axis] == x.shape[axis] * n.
+    idx_or_t : 1-D ndarray
+        Pseudo-indices (0, 1/n, 2/n, …) or interpolated time-stamps.
+    """
+    x = np.asarray(x)
+    y, s = semiflatten(x, axis)  # y: (K, L), axis d is now the last dim
+    K, L = y.shape
+
+    if n == 1:
+        return semiunflatten(y, s), (t if t is not None else np.arange(L))
+
+    f = np.fft.fft(y, axis=1)
+    half = L // 2
+
+    if taper > 0:
+        # Raised-cosine rolloff applied to the K bins nearest the Nyquist
+        # boundary on both sides of the spectrum.  This smooths the hard
+        # rectangular cutoff that causes Gibbs ringing, without touching
+        # any time-domain values directly.
+        K_tap = min(max(1, int(half * taper)), half - 1)
+        # rolloff[0] = 1, rolloff[-1] ≈ 0  (falls smoothly over K_tap bins)
+        rolloff = 0.5 * (1 + np.cos(np.pi * np.arange(K_tap) / K_tap))
+        f[:, half - K_tap:half] *= rolloff          # positive freqs near Nyquist
+        f[:, [half]] = 0                             # zero Nyquist itself
+        f[:, half + 1:half + 1 + K_tap] *= rolloff[::-1]  # mirror: negative freqs
+
+    if n % 2:
+        # Odd upsampling factor: the Nyquist bin has no symmetric counterpart
+        # in the new grid, so split its energy equally between the two adjacent
+        # bins on either side of the zero-pad block.
+        nyq = f[:, [half]] / 2
+        pad = np.zeros((K, L * (n - 1) - 1), dtype=f.dtype)
+        f = np.concatenate([f[:, :half], nyq, pad, nyq, f[:, half + 1:]], axis=1)
+    else:
+        # Even upsampling factor: the original Nyquist bin maps cleanly to the
+        # Nyquist of the upsampled grid; insert zeros between positive and
+        # negative frequency halves.
+        pad = np.zeros((K, L * (n - 1)), dtype=f.dtype)
+        f = np.concatenate([f[:, :half], pad, f[:, half:]], axis=1)
+
+    # For real inputs, the imaginary residual is floating-point noise; discard it.
+    # For complex inputs (e.g. x + j*y position phasors), keep the full result.
+    y_up = np.fft.ifft(f, axis=1) * n
+    if not np.iscomplexobj(x):
+        y_up = y_up.real
+    idx = np.arange(L * n) / n
+    y_up = semiunflatten(y_up, s)
+
+    if t is None:
+        return y_up, idx
+    return y_up, np.interp(idx, np.arange(len(t)), t)
+
+
+def medfilt_smooth(arr, MEDFILT_KERNEL_SIZE=5):
+    """"""
+    assert np.iscomplexobj(arr), "Array must be complex"
+    return medfilt(arr.real, MEDFILT_KERNEL_SIZE) + medfilt(arr.imag, MEDFILT_KERNEL_SIZE)*1j
 
 
 
@@ -134,7 +241,7 @@ def get_speed_timeseries(arr:np.complex128, fps):
 def read_DLC_csv(path):
     """Reads DLC csv and returns a pandas dataframe"""
     # Get length of header
-    sniffer_df = pd.read_csv(path, header=None)
+    sniffer_df = pd.read_csv(path, header=None, low_memory=False)
 
     # Number of elements in the first 9 elements of the first column
     # This is to determine how many header rows there are before it starts doing '0', '1', '2', etc.
@@ -154,7 +261,7 @@ def read_DLC_csv(path):
 
 
 
-def boris_to_array(b_df, n_frames):
+def boris_to_array(b_df:pd.DataFrame, n_frames:int):
     """ Convert a Boris DataFrame to an array of behaviors.
     
     Parameters
@@ -447,6 +554,31 @@ def flatten_l(xss):
     return [x for xs in xss for x in xs]
 
 
+def rename_df_cols(df):
+    """Renames dataframe columns so that they are only two items long"""
+    df.columns = [tuple(col[-2:]) for col in df.columns]
+    return df
+
+
+def get_likelihood(df, bodypart):
+    """
+    Parameters
+    ----------
+    df: (pandas.DataFrame) DLC dataframe, parsed with read_DLC_csv
+    bodypart: (str) Bodypart to get
+    
+    Returns
+    -------
+    np.array (complex numbers)
+    """
+    '''Sometimes dlc dfs have three or two elements in their column names.
+    Here I will simply check the second to last element'''
+    # First, make all columns equal to the original values last two elements.
+    df = rename_df_cols(df)
+    L = df[(bodypart, "likelihood")]
+    return L
+
+
 def get_bodypart(df, bodypart):
     """
     Parameters
@@ -461,9 +593,9 @@ def get_bodypart(df, bodypart):
     '''Sometimes dlc dfs have three or two elements in their column names.
     Here I will simply check the second to last element'''
     # First, make all columns equal to the original values last two elements.
-    df.columns = [tuple(col[-2:]) for col in df.columns]
+    L = get_likelihood(df, bodypart)
     arr = df[[(bodypart, "x"), (bodypart, "y")]].values
-    return arr[:,0] + 1j * arr[:,1]
+    return arr[:,0] + 1j * arr[:,1], L
 
 
 def clean_target_positions(df):
@@ -493,7 +625,7 @@ def clean_target_positions(df):
         dilated_mask = nd.binary_dilation(np.isnan(target_x), structure=np.ones(2))
         target_x[np.where(dilated_mask)[0]], target_y[np.where(dilated_mask)[0]] = np.nan, np.nan
 
-    target_x, target_y = scipy.signal.medfilt(target_x, 5), scipy.signal.medfilt(target_y, 5)
+    # target_x, target_y = scipy.signal.medfilt(target_x, 5), scipy.signal.medfilt(target_y, 5)
     return target_x, target_y
 
 
@@ -524,56 +656,62 @@ def get_relevant_measures(dlc_csv, conversion_rate):
     df = read_DLC_csv(dlc_csv)
 
     # Get mouse and target positions
-    neck = interpolate_cubic_spline(get_bodypart(df, "spine1"))
-    neck_x, neck_y = neck.real, neck.imag
-
-    snout = interpolate_cubic_spline(get_bodypart(df, "snout"))
-    snout_x, snout_y = snout.real, snout.imag
-
-    base = interpolate_cubic_spline(get_bodypart(df, "tailbase"))
-    base_x, base_y = base.real, base.imag
+    neck =  interpolate_cubic_spline(get_bodypart(df,   "spine1")[0])
+    snout = interpolate_cubic_spline(get_bodypart(df,    "snout")[0])
+    base =  interpolate_cubic_spline(get_bodypart(df, "tailbase")[0])
 
     # Get target positions
     # Remove target outliers by using the mag, and then for when the likelihood of the roach is greater than the mag, use the roach.
     if ("mag", "x") in df.columns.tolist():
-        target = get_bodypart(df, "mag")
+        target, _ = get_bodypart(df, "mag")
+
         # If the likelihood of the roach is greater than the mag, use the roach
-        swap_in_roach_inds = np.where(df[('single', 'roach', 'likelihood')] > df[('single', 'mag', 'likelihood')])[0]
-        target_x[swap_in_roach_inds] = df[('single', 'roach', 'x')][swap_in_roach_inds]
-        target_y[swap_in_roach_inds] = df[('single', 'roach', 'y')][swap_in_roach_inds]
+        roach_L, mag_L = get_likelihood(df, "roach"), get_likelihood(df, "mag")
+        swap_in_roach_inds = np.where(roach_L > mag_L)[0]
+        swap_in_roach_vals = get_bodypart(df, "roach")[0][swap_in_roach_inds]
+        target[swap_in_roach_inds] = swap_in_roach_vals
 
     elif ("puck", "x") in df.columns.tolist():
-        target = get_bodypart(df, "puck")
-    
+        target, L = get_bodypart(df, "puck")
+
     else:
         raise ValueError("No target found in DLC data. Please check the DLC csv file.")
     
-    target_x, target_y = target.real, target.imag
 
     # If the distance between two points is greater than 100, it's an outlier
-    aberrant_inds = np.where(np.sqrt(np.diff(target_x) ** 2 + np.diff(target_y)) > 100)[0]
-    target_x[aberrant_inds], target_y[aberrant_inds] = np.nan, np.nan
-    target_x, target_y = interpolate_cubic_spline(target_x), interpolate_cubic_spline(target_y)
+    def remove_outliers(arr, thres=100):
+        aberrant_inds = np.where(np.abs(np.diff(arr)) > thres)[0]
+        arr[aberrant_inds] = np.nan
+        arr = interpolate_cubic_spline(arr)
+        return arr
     
-    # target_x, target_y = clean_target_positions(df)
-    # Smooth all the data
-    neck_x, neck_y = smooth(neck_x), smooth(neck_y)
-    snout_x, snout_y = smooth(snout_x), smooth(snout_y)
-    base_x, base_y = smooth(base_x), smooth(base_y)
-    target_x, target_y = smooth(target_x), smooth(target_y)
+    # remove outliers
+    target = remove_outliers(target)
+    neck = remove_outliers(neck)
+    snout = remove_outliers(snout)
+    base = remove_outliers(base)
+
+    # # Smooth
+    neck = smooth(neck)
+    # neck = medfilt_smooth(neck)
+    snout = smooth(snout)
+    # snout = medfilt_smooth(snout)
+    base = smooth(base)
+    # base = medfilt_smooth(base)
+    target = smooth(target)
+    # target = medfilt_smooth(target)
 
     # suppress warnings using with statement
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         
         # Get distances
-        dist = np.sqrt((neck_x - target_x) ** 2 + (neck_y - target_y) ** 2) / conversion_rate
-
+        dist = np.abs(neck - target) / conversion_rate # complex
        
         # Get angles
-        LOS = (target_x - neck_x) + (target_y - neck_y) * 1j
-        head_vector = (snout_x - neck_x) + (snout_y - neck_y) * 1j
-        body_vector = (neck_x - base_x) + (neck_y - base_y) * 1j
+        LOS = target - neck
+        head_vector = snout - neck 
+        body_vector = neck - base
 
         # Egocentric head angle
         ego_angle = get_angular_difference_array(head_vector, body_vector)
@@ -586,8 +724,8 @@ def get_relevant_measures(dlc_csv, conversion_rate):
         
     return {
         'LOS':LOS, 'head_vector':head_vector, 'body_vector':body_vector, 'ego_angle':ego_angle, 'target_bearing':target_bearing,
-        'head_angle':head_angle, 'dist':dist, "neck": (neck_x, neck_y),
-        "snout": (snout_x, snout_y), "base": (base_x, base_y), "target":(target_x, target_y), 'df':df
+        'head_angle':head_angle, 'dist':dist, "neck": (neck.real, neck.imag),
+        "snout": (snout.real, snout.imag), "base": (base.real, base.imag), "target":(target.real, target.imag), 'df':df
     }
 
 
@@ -612,7 +750,8 @@ def get_boris_bout(boris_df, bout_ind, behavior="approach"):
 
 
 def behavior_bout_generator(avi_boris_dlc, conversion_rate, behavior="approach", warnings=True):
-    """"""# Now, generate videos of each behavior with the target and head vectors moving through space
+    """
+    """
     for avi_index, (avi_file, boris_tsv, dlc_csv, cv2_csv) in enumerate(avi_boris_dlc):
         # Identify missing data
         if boris_tsv is None:
@@ -636,7 +775,10 @@ def behavior_bout_generator(avi_boris_dlc, conversion_rate, behavior="approach",
         boris_df = clean_boris(boris_df)
         
         # Remove irrelevant behaviors
-        boris_df = boris_df.loc[boris_df["Behavior"] == behavior,:]
+        if behavior != "all":
+            boris_df = boris_df.loc[boris_df["Behavior"] == behavior,:]
+
+
         
         relevant_measures = get_relevant_measures(dlc_csv, conversion_rate)
 
@@ -864,6 +1006,6 @@ def parse_param_string(param_string):
     -------
     np.array
     """ 
-    return np.fromstring(param_string.strip("[]"), sep=" ")
+    return np.fromstring(param_string.strip("()"), sep=" ") # []
 
 
