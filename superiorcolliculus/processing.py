@@ -223,6 +223,51 @@ def build_lag_matrix(data, L, mode="causal", dtype=np.float64):
     return X, n_lags
 
 
+def raised_cosine_basis(n_lags, n_basis, log_warp=False):
+    """Build an (n_lags, n_basis) raised-cosine temporal-filter basis.
+
+    Each basis function is a cosine "bump" f(x) = 0.5*(cos(x) + 1) for
+    |x| < pi and 0 elsewhere, with centers evenly spaced across the lag
+    axis and spacing equal to each bump's half-width, so adjacent bumps
+    overlap at 50% height and sum to a smooth, near-flat envelope
+    (standard raised-cosine tiling for temporal-filter bases, e.g. Pillow
+    et al. 2005).
+
+    Used to fit a predictor's temporal kernel as n_basis coefficients
+    instead of n_lags — project the raw per-lag design matrix onto this
+    basis before fitting (X_raw @ B), and expand a fitted basis-space
+    coefficient vector back to full lag resolution afterward (B @ coef_basis).
+
+    Parameters
+    ----------
+    n_lags   : number of lag positions the basis is evaluated at (matches
+               the n_lags from build_lag_matrix for the same L/mode)
+    n_basis  : number of basis functions (fitted parameters per kernel)
+    log_warp : if True, evaluate over x = log(lag + 1) instead of a linear
+               lag axis — biases resolution toward short lags. Only makes
+               sense for a causal-only (history) kernel; leave False for a
+               possibly-symmetric window (default, matches linear spacing).
+
+    Returns
+    -------
+    B : (n_lags, n_basis) array; column j is the j-th basis function
+        evaluated at each lag position.
+    """
+    lag_idx = np.arange(n_lags, dtype=float)
+    x = np.log(lag_idx + 1.0) if log_warp else lag_idx
+    if n_basis == 1:
+        centers = np.array([(x[0] + x[-1]) / 2.0])
+        spacing = max(x[-1] - x[0], 1e-6)
+    else:
+        centers = np.linspace(x[0], x[-1], n_basis)
+        spacing = centers[1] - centers[0]
+    B = np.zeros((n_lags, n_basis))
+    for j, c in enumerate(centers):
+        z = np.pi * (x - c) / spacing
+        B[:, j] = 0.5 * (np.cos(np.clip(z, -np.pi, np.pi)) + 1.0)
+    return B
+
+
 def phasor(angle):
     """
     Parameters
