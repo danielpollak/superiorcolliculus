@@ -419,6 +419,55 @@ def MSE(prediction, ground_truth):
     return mse
 
 
+# ---------------------------------------------------------------------------
+# Newer metrics (promoted from superior_colliculus/analysis/shared/metrics.py,
+# where they're the de facto shared implementation used across behavioral and
+# neural decoding analyses). Kept alongside get_VAF/MAE/MSE/residual_variance
+# above rather than replacing them — those are still used by archived code
+# in that repo and aren't touched here.
+# ---------------------------------------------------------------------------
+
+def compute_vaf(y_pred, y_true):
+    """VAF = 1 - Var(y_pred - y_true) / Var(y_true). Returns nan if Var(y_true)==0."""
+    y_pred = np.asarray(y_pred, dtype=float)
+    y_true = np.asarray(y_true, dtype=float)
+    gt_var = np.var(y_true)
+    return float("nan") if gt_var == 0 else 1.0 - np.var(y_pred - y_true) / gt_var
+
+
+def compute_weighted_r2(x, y, w):
+    """Weighted Pearson r^2 with weights w (negatives clamped to zero).
+
+    Equivalent to squared weighted Pearson correlation; gives more influence
+    to high-weight samples (e.g. fast-moving frames) in the correlation estimate.
+    Returns nan if fewer than 2 non-zero weights or if either weighted variance is zero.
+    """
+    x, y, w = np.asarray(x, float), np.asarray(y, float), np.asarray(w, float)
+    w = np.clip(w, 0, None)
+    w_sum = w.sum()
+    if w_sum == 0 or (w > 0).sum() < 2:
+        return float("nan")
+    w = w / w_sum
+    x_bar = (w * x).sum()
+    y_bar = (w * y).sum()
+    cov_xy = (w * (x - x_bar) * (y - y_bar)).sum()
+    var_x = (w * (x - x_bar) ** 2).sum()
+    var_y = (w * (y - y_bar) ** 2).sum()
+    if var_x == 0 or var_y == 0:
+        return float("nan")
+    return float((cov_xy / np.sqrt(var_x * var_y)) ** 2)
+
+
+def r2_score(y_true, y_hat):
+    """R^2 = 1 - SS_res / SS_tot. Returns nan if input is empty or SS_tot == 0."""
+    y_true = np.asarray(y_true, dtype=float)
+    y_hat = np.asarray(y_hat, dtype=float)
+    if len(y_true) == 0:
+        return float("nan")
+    ss_tot = np.sum((y_true - y_true.mean()) ** 2)
+    return float("nan") if ss_tot == 0 else 1.0 - float(np.sum((y_true - y_hat) ** 2) / ss_tot)
+
+
 from concurrent.futures import ProcessPoolExecutor
 def compute_cost(args):
     """Helper function to make cost picklable."""
