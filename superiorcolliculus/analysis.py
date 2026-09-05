@@ -468,6 +468,101 @@ def r2_score(y_true, y_hat):
     return float("nan") if ss_tot == 0 else 1.0 - float(np.sum((y_true - y_hat) ** 2) / ss_tot)
 
 
+# ---------------------------------------------------------------------------
+# Generic bootstrap / multiple-comparison primitives (promoted from
+# superior_colliculus/dissemination/CCN_2026_poster/CCN_2026_behavior.ipynb's
+# notebook-local paired-bootstrap significance layer). Not specific to VAF,
+# animals/bouts, or any particular pair of models -- see
+# superior_colliculus/analysis/behavior/vaf_bootstrap.py for the
+# guidance-law-specific orchestration built on top of these.
+# ---------------------------------------------------------------------------
+
+def holm_correction(pvals):
+    """Standard Holm step-down correction for multiple comparisons."""
+    pvals = np.asarray(pvals, dtype=float)
+    order = np.argsort(pvals)
+    m = len(pvals)
+    adj = np.empty(m)
+    running_max = 0.0
+    for rank, idx in enumerate(order):
+        running_max = max(running_max, (m - rank) * pvals[idx])
+        adj[idx] = min(running_max, 1.0)
+    return adj
+
+
+def two_stage_cluster_bootstrap(df, group_col, bout_cols, value_cols, metric_fn,
+                                 n_boot=500, seed=0, diagnostics=None, diag_key=None):
+    """Two-stage cluster bootstrap: resample `group_col` values (e.g. animals)
+    with replacement, then resample `df.groupby(bout_cols)` groups (e.g.
+    (avi, event ind) bouts) within each chosen group -- no finer blocking --
+    capping every group's contribution to a shared frame budget (the minimum
+    total row count available from any one group value present in `df`, so a
+    data-rich group can't out-weigh a data-poor one). Pools the resulting rows
+    and applies `metric_fn(pooled[value_cols[1]], pooled[value_cols[0]])`
+    (prediction, then ground truth) per replicate.
+
+    Not specific to VAF, animals, or bouts -- any two nested grouping columns
+    and any two-argument metric_fn work, as long as `value_cols` names two
+    numeric columns in `df` (e.g. ("y", "y_hat")).
+
+    `diagnostics`/`diag_key`: if `diagnostics` is a list, one dict describing
+    this call's (n_groups, min_frames, frames_per_group) is appended to it,
+    tagged with `diag_key` -- for reporting bootstrap sample-size context
+    alongside whatever significance test consumes the returned replicates.
+
+    Returns an (n_boot,) array of per-replicate metric values, or an empty
+    array if fewer than 2 distinct `group_col` values are present.
+    """
+    groups = df[group_col].unique()
+    if len(groups) < 2:
+        return np.array([])
+    bouts_by_group = {
+        g: {k: gdf2[list(value_cols)].values for k, gdf2 in gdf.groupby(list(bout_cols))}
+        for g, gdf in df.groupby(group_col)
+    }
+    frames_per_group = {g: sum(len(v) for v in bd.values()) for g, bd in bouts_by_group.items()}
+    min_frames = min(frames_per_group.values())
+
+    if diagnostics is not None:
+        diagnostics.append(dict(bin=diag_key, n_animals=len(groups), min_frames=min_frames,
+                                 frames_per_animal=dict(sorted(frames_per_group.items()))))
+
+    rng = np.random.default_rng(seed)
+    vafs = np.empty(n_boot)
+    for b in range(n_boot):
+        chosen_groups = rng.choice(groups, size=len(groups), replace=True)
+        chunks = []
+        for g in chosen_groups:
+            bout_dict = bouts_by_group[g]
+            bout_keys = list(bout_dict.keys())
+            acc = 0
+            while acc < min_frames:
+                arr = bout_dict[bout_keys[rng.integers(0, len(bout_keys))]]
+                chunks.append(arr)
+                acc += len(arr)
+        pooled = np.concatenate(chunks, axis=0)
+        vafs[b] = metric_fn(pooled[:, 1], pooled[:, 0])
+    return vafs
+
+
+def paired_bootstrap_test(a, b):
+    """Two-sided fraction of paired bootstrap replicates where a - b doesn't
+    cross 0. a, b: equal-length 1D arrays of paired replicate values (e.g.
+    two models' bootstrapped VAF for the same replicate index -- pairing is
+    the caller's responsibility, via matching replicate order/position, not
+    an explicit join key)."""
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    diff = a - b
+    n = len(diff)
+    if n == 0:
+        return dict(n=0, mean_diff=float("nan"), p=float("nan"))
+    n_le = int((diff <= 0).sum())
+    n_ge = int((diff >= 0).sum())
+    p = min(1.0, 2 * min(n_le, n_ge) / n)
+    return dict(n=n, mean_diff=float(diff.mean()), p=p)
+
+
 from concurrent.futures import ProcessPoolExecutor
 def compute_cost(args):
     """Helper function to make cost picklable."""
